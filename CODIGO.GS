@@ -67,6 +67,15 @@ const PEDIDOS_LOTE_COL          = 20; // U (coluna 21) — número de lote da co
 const DB_LOTE_COL               = 20; // U (coluna 21) — número de lote propagado do PEDIDOS para o Relatorio_DB
 const LOTE_DILLY_SHEET_NAME     = 'LOTE DILLY'; // aba com mapeamento OC→Lote para o cliente Dilly
 
+// Mapeamento DADOS_IMPORTADOS (fonteRow, a partir da col B) → PEDIDOS (a partir da col A).
+// B-K: deslocamento +1 (fonteRow[i] → PEDIDOS col i+1). L-O: sem deslocamento — PEDIDOS
+// L (CÓD.OS), M (DATA RECEB.), N (DT.ENTREGA), O (PRAZO) agora vêm de DADOS_IMPORTADOS
+// M, N, O, P (fonteRow[11..14]).
+const FONTE_PARA_PEDIDOS_COLS = [
+  [0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[6,7],[7,8],[8,9],[9,10],
+  [11,11],[12,12],[13,13],[14,14]
+];
+
 // ====== ABA ORIGINAL (fonte primária para ordenação dos itens dentro de cada OC) ======
 const ORIGINAL_SHEET_NAME = 'original'; // nome exato da aba
 const ORIG_OC_COL   = 7;  // H — Ordem de Compra
@@ -1194,8 +1203,10 @@ function verificarEGerarIDs() {
  * Muito mais rápido e confiável que o IMPORTRANGE nativo.
  */
 function importarDadosExternos() {
-  const SOURCE_ID    = '1GtYG4Ahy5XJyJjE37S27u8RyELdRkct8nDAVGIBRI-w';
+  const SOURCE_ID    = '1YoSxArGafauFK8DNf6w9C3CfKGvJ4ECKdMUs2n6Zh58';
   const SOURCE_SHEET = 'RELATÓRIO GERAL DA PRODUÇÃO1';
+  const SOURCE_ROWS  = 6000;
+  const SOURCE_COLS  = 23; // A até W
 
   // Coluna J (índice 9): valores como "82249D" e "14660U" têm formatação customizada
   // no Sheets — getValues() retorna só o número cru (sem sufixo). Por isso usamos
@@ -1207,20 +1218,11 @@ function importarDadosExternos() {
     const sourceSheet = SpreadsheetApp.openById(SOURCE_ID).getSheetByName(SOURCE_SHEET);
     if (!sourceSheet) throw new Error(`Aba "${SOURCE_SHEET}" não encontrada na planilha externa.`);
 
-    // Usa lastRow/lastColumn dinâmico — evita ler 5000 linhas vazias
-    const srcLastRow = sourceSheet.getLastRow();
-    const srcLastCol = sourceSheet.getLastColumn();
-    if (srcLastRow < 1) {
-      Logger.log('⚠️ importarDadosExternos: nenhum dado encontrado na fonte.');
-      return { success: false, erro: 'Sem dados na fonte' };
-    }
-
-    // Leitura única com getValues() — muito mais rápido que getDisplayValues() na range grande
-    const rangeRef = sourceSheet.getRange(1, 1, srcLastRow, srcLastCol);
-    const dados = rangeRef.getValues();
+    // Leitura fixa A1:W6000 — independe de getLastRow()/getLastColumn() da fonte
+    const dados = sourceSheet.getRange(1, 1, SOURCE_ROWS, SOURCE_COLS).getValues();
 
     // Lê display values SOMENTE da coluna J (range de 1 coluna × N linhas = muito menor)
-    const colJDisplay = sourceSheet.getRange(1, COL_J + 1, srcLastRow, 1).getDisplayValues();
+    const colJDisplay = sourceSheet.getRange(1, COL_J + 1, SOURCE_ROWS, 1).getDisplayValues();
 
     // Remove linhas em branco do final
     let ultimaLinha = dados.length;
@@ -1258,13 +1260,10 @@ function importarDadosExternos() {
     destSheet.getRange(1, 1, dadosFiltrados.length, numCols).setValues(dadosFiltrados);
 
     // Copia explícita das colunas X (24) e Y (25) da fonte → DADOS_IMPORTADOS
-    // Necessário pois getLastColumn() pode não detectar colunas sem cabeçalho
-    const srcRowsCopia = Math.min(5000, srcLastRow);
-    if (srcRowsCopia >= 1) {
-      const colXYData = sourceSheet.getRange(1, 24, srcRowsCopia, 2).getValues();
-      destSheet.getRange(1, 24, srcRowsCopia, 2).setValues(colXYData);
-      Logger.log(`✅ Colunas X e Y copiadas da fonte: ${srcRowsCopia} linhas → DADOS_IMPORTADOS cols X/Y`);
-    }
+    // (fora do range A1:W lido acima)
+    const colXYData = sourceSheet.getRange(1, 24, SOURCE_ROWS, 2).getValues();
+    destSheet.getRange(1, 24, SOURCE_ROWS, 2).setValues(colXYData);
+    Logger.log(`✅ Colunas X e Y copiadas da fonte: ${SOURCE_ROWS} linhas → DADOS_IMPORTADOS cols X/Y`);
 
     // Atualiza timestamp em H2 — detectado pelo guard em sincronizarPedidosComFonte()
     const ts = Utilities.formatDate(new Date(), TZ, 'dd/MM/yyyy HH:mm:ss');
@@ -1584,9 +1583,9 @@ function sincronizarPedidosComFonte(forcarExecucao) {
           if (!isNovo) {
             itensAtualizados++;
             // Detecta mudança real nos dados
-            for (let fi = 0; fi <= 13; fi++) {
+            for (const [fi, pi] of FONTE_PARA_PEDIDOS_COLS) {
               const fv = fonteRow[fi];
-              const pv = matchEscolhido.row[fi + 1];
+              const pv = matchEscolhido.row[pi];
               const fStr = fv instanceof Date ? _toISOStringSafe_(fv) : String(fv || '');
               const pStr = pv instanceof Date ? _toISOStringSafe_(pv) : String(pv || '');
               if (fStr !== pStr) { itensComMudancaReal++; break; }
@@ -1601,7 +1600,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         if (_fonteClienteStr_.toUpperCase().includes('DILLY') && pedidosDillyMap.size > 0) {
           const _dTam_    = String(fonteRow[7] || '').trim();
           const _dMarfim_ = _normalizarMarfimDilly_(String(fonteRow[5] || '').trim(), _dTam_, _fonteClienteStr_);
-          const _dillyFpSemOS_ = `${_fonteClienteStr_}|${String(fonteRow[3] || '').trim()}|${_dMarfim_}|${_dTam_}|${String(fonteRow[8] || '').trim()}|${_normalizarData_(fonteRow[11])}`;
+          const _dillyFpSemOS_ = `${_fonteClienteStr_}|${String(fonteRow[3] || '').trim()}|${_dMarfim_}|${_dTam_}|${String(fonteRow[8] || '').trim()}|${_normalizarData_(fonteRow[12])}`;
           const _dillySlots_ = pedidosDillyMap.get(_dillyFpSemOS_);
           if (_dillySlots_) {
             const _dillySlot_ = _dillySlots_.find(m => !m.usado);
@@ -1641,7 +1640,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       // Se é novo item, gera ID e timestamp
       if (isNovo) {
         // Gera ID usando lógica existente (concatenação + sufixo)
-        const dataReceb = fonteRow[11]; // Coluna L em DADOS_IMPORTADOS = DATA RECEB. (índice 11)
+        const dataReceb = fonteRow[12]; // Coluna N em DADOS_IMPORTADOS = DATA RECEB. (índice 12)
         const dataFormatada = dataReceb instanceof Date ?
           Utilities.formatDate(dataReceb, TZ, 'yyyyMMdd') :
           String(dataReceb || '').trim();
@@ -1656,8 +1655,8 @@ function sincronizarPedidosComFonte(forcarExecucao) {
           String(fonteRow[5] || '').trim() +  // CÓD. MARFIM
           String(fonteRow[7] || '').trim() +  // TAMANHO
           String(fonteRow[8] || '').trim() +  // ORD. COMPRA
-          String(fonteRow[10] || '').trim() + // CÓD. OS
-          dataFormatada;                       // DATA RECEBIMENTO (col M)
+          String(fonteRow[11] || '').trim() + // CÓD. OS (DADOS_IMPORTADOS col M)
+          dataFormatada;                       // DATA RECEBIMENTO (col N)
 
         // Gera sufixo único
         let sufixo = 1;
@@ -1693,9 +1692,9 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         const desc = String(fonteRow[6]  || '').trim(); // H: DESCRIÇÃO
         const tam  = String(fonteRow[7]  || '').trim(); // I: TAMANHO
         const qtd  = String(fonteRow[9]  || '').trim(); // K: QTD. ABERTA
-        const data = fonteRow[11] instanceof Date
-          ? Utilities.formatDate(fonteRow[11], TZ, 'yyyy-MM-dd')
-          : String(fonteRow[11] || '').trim();          // M: DATA RECEB.
+        const data = fonteRow[12] instanceof Date
+          ? Utilities.formatDate(fonteRow[12], TZ, 'yyyy-MM-dd')
+          : String(fonteRow[12] || '').trim();          // N: DATA RECEB.
         const chave = `${oc}|${desc}|${tam}|${qtd}|${data}`;
         const posOriginal = originalPosMap.get(chave);
         posicaoFonte = (posOriginal !== undefined) ? posOriginal : (900000 + idx);
@@ -1722,7 +1721,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       // Para o cliente Dilly: determina CÓD. OS via aba LOTE DILLY (sobrescreve DADOS_IMPORTADOS).
       // Chave: OC | código-base do CÓD. CLIENTE (prefixo antes do último "-") | tamanho numérico | qtd
       // FIFO: cada item consome o próximo Lote disponível na fila para essa chave.
-      let _osFinal_ = fonteRow[10]; // padrão: CÓD. OS de DADOS_IMPORTADOS (col L)
+      let _osFinal_ = fonteRow[11]; // padrão: CÓD. OS de DADOS_IMPORTADOS (col M)
       const _ehDilly_ = _clienteStr_.toUpperCase().includes('DILLY');
       if (_ehDilly_ && loteDillyMap.size > 0) {
         // Usa o CÓD. CLIENTE corrigido como base da chave (ex: "196338-110" → "196338")
@@ -1753,9 +1752,9 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         fonteRow[8],       // J: ORD. COMPRA
         fonteRow[9],       // K: QTD. ABERTA
         _osFinal_,         // L: CÓD. OS (Dilly: valor do Lote via LOTE DILLY; demais: DADOS_IMPORTADOS)
-        (fonteRow[11] instanceof Date ? fonteRow[11] : (!fonteRow[11] || fonteRow[11] === 0 ? '' : fonteRow[11])), // M: DATA RECEB. — 0 vira '' (evita 30/12/1899)
-        fonteRow[12],      // N: DT. ENTREGA
-        String(fonteRow[13] !== null && fonteRow[13] !== undefined && fonteRow[13] !== '' ? fonteRow[13] : ''), // O: PRAZO — string evita -1/2 virar data
+        (fonteRow[12] instanceof Date ? fonteRow[12] : (!fonteRow[12] || fonteRow[12] === 0 ? '' : fonteRow[12])), // M: DATA RECEB. — 0 vira '' (evita 30/12/1899)
+        fonteRow[13],      // N: DT. ENTREGA
+        String(fonteRow[14] !== null && fonteRow[14] !== undefined && fonteRow[14] !== '' ? fonteRow[14] : ''), // O: PRAZO — string evita -1/2 virar data
         timestampFinal,    // P: TIMESTAMP_CRIACAO
         posicaoFonte,      // Q: POSICAO_FONTE — índice na aba "original" (fixo, nunca muda)
         '',                // R: (reservado)
@@ -1856,15 +1855,17 @@ function _criarImpressaoDigitalFromRow_(row, offset) {
   // ela mudava, perdendo todo o histórico e marcações do item no Relatorio_DB.
   //
   // Campos estáveis usados como identidade (inclui TAMANHO para distinguir tamanhos):
-  // DADOS_IMPORTADOS (offset=0): lido a partir col B → CLIENTE=1, PEDIDO=3, MARFIM=5, TAM=7, OC=8, OS=10, DATA=11
-  // PEDIDOS          (offset=1): CLIENTE=2, PEDIDO=4, MARFIM=6, TAM=8, OC=9, OS=11, DATA=12
+  // DADOS_IMPORTADOS (offset=0): lido a partir col B → CLIENTE=1, PEDIDO=3, MARFIM=5, TAM=7, OC=8
+  // PEDIDOS          (offset=1): CLIENTE=2, PEDIDO=4, MARFIM=6, TAM=8, OC=9
+  // OS e DATA: com o mapeamento atual (PEDIDOS L←DADOS_IMPORTADOS M, PEDIDOS M←DADOS_IMPORTADOS N),
+  // os índices coincidem nos dois casos → OS=11, DATA=12 (sem somar offset).
 
   const cliente = String(row[1 + offset] || '').trim();
   const pedido  = String(row[3 + offset] || '').trim();
   const tam     = String(row[7 + offset] || '').trim();  // TAMANHO — diferencia itens do mesmo pedido em tamanhos distintos
   const oc      = String(row[8 + offset] || '').trim();
-  const os      = String(row[10 + offset] || '').trim();
-  const dataStr = _normalizarData_(row[11 + offset]);    // normalizado para Date e número serial
+  const os      = String(row[11] || '').trim();
+  const dataStr = _normalizarData_(row[12]);    // normalizado para Date e número serial
 
   // Normaliza CÓD. MARFIM para Dilly: garante fingerprint idêntica tanto ao ler
   // de DADOS_IMPORTADOS (valor original, ex: "202480-105") quanto de PEDIDOS
@@ -2585,10 +2586,10 @@ function sincronizarDados() {
       const importSheet = getSpreadsheet_().getSheetByName(IMPORTRANGE_SHEET_NAME);
       if (importSheet && importSheet.getLastRow() >= FONTE_DATA_START_ROW) {
         const impLastRow = importSheet.getLastRow();
-        // Col J (10) = OC, Col L (12) = OS — lê 3 colunas (J, K, L) e usa índices 0 e 2
+        // Col J (10) = OC, Col M (13) = OS — lê 4 colunas (J, K, L, M) e usa índices 0 e 3
         // Usa getDisplayValues() para preservar sufixos como "13807U", "14660U"
-        const vals = importSheet.getRange(FONTE_DATA_START_ROW, 10, impLastRow - FONTE_DATA_START_ROW + 1, 3).getDisplayValues();
-        vals.forEach(([oc, , os]) => {
+        const vals = importSheet.getRange(FONTE_DATA_START_ROW, 10, impLastRow - FONTE_DATA_START_ROW + 1, 4).getDisplayValues();
+        vals.forEach(([oc, , , os]) => {
           const ocStr = String(oc || '').trim();
           const osStr = String(os || '').trim();
           if (ocStr || osStr) {
