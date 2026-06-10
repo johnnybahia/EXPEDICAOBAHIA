@@ -63,7 +63,7 @@ const PEDIDOS_POSICAO_FONTE_COL = 16; // Q (coluna 17) — índice do item em DA
 const DB_POSICAO_FONTE_COL      = 17; // R (coluna 18) — posição propagada do PEDIDOS para o Relatorio_DB
 const PEDIDOS_COLX_COL          = 19; // T (coluna 20) — campo da coluna X da fonte (informação adicional da OC)
 const DB_COLX_COL               = 19; // T (coluna 20) — campo da coluna X propagado do PEDIDOS para o Relatorio_DB
-const PEDIDOS_LOTE_COL          = 20; // U (coluna 21) — número de lote da coluna Y da fonte
+const PEDIDOS_LOTE_COL          = 20; // U (coluna 21) — número de lote da coluna L da fonte
 const DB_LOTE_COL               = 20; // U (coluna 21) — número de lote propagado do PEDIDOS para o Relatorio_DB
 const LOTE_DILLY_SHEET_NAME     = 'LOTE DILLY'; // aba com mapeamento OC→Lote para o cliente Dilly
 
@@ -1339,7 +1339,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
     }
 
     // Lê dados da fonte a partir da coluna B (dados começam em B, coluna A ignorada)
-    // Garante pelo menos 24 colunas (B→Y) para cobrir fonteRow[23] = col Y = LOTE
+    // Garante pelo menos 24 colunas (B→Y) para cobrir fonteRow[22] = col X = INFO_X
     const fonteNumCols = Math.max(fonteSheet.getLastColumn() - 1, 24);
     const fonteData = fonteSheet.getRange(FONTE_DATA_START_ROW, 2, fonteLastRow - FONTE_DATA_START_ROW + 1, fonteNumCols).getValues();
     Logger.log(`📥 Leu ${fonteData.length} linhas de ${IMPORTRANGE_SHEET_NAME}`);
@@ -1760,7 +1760,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         '',                // R: (reservado)
         codigoFixo,        // S: CÓDIGO_FIXO — UUID imutável por item
         fonteRow[22] !== undefined ? fonteRow[22] : '',  // T: INFO_X — coluna X da fonte (informação adicional da OC)
-        fonteRow[23] !== undefined ? fonteRow[23] : ''   // U: LOTE — coluna Y da fonte (número de lote)
+        fonteRow[10] !== undefined ? fonteRow[10] : ''   // U: LOTE — coluna L da fonte (número de lote)
       ];
 
       novasPedidosData.push(novaLinha);
@@ -3602,7 +3602,7 @@ const RELATORIO_DB_HEADERS = [
   'POSICAO_FONTE',          // R - índice do item em DADOS_IMPORTADOS (preserva ordem original)
   'CODIGO_FIXO',            // S - UUID imutável por item
   'INFO_X',                 // T - campo da coluna X da fonte (informação adicional da OC)
-  'LOTE',                   // U - número de lote da coluna Y da fonte
+  'LOTE',                   // U - número de lote da coluna L da fonte
   'MARCAR_FATURAR_USUARIO', // V - usuário que marcou o item para faturamento
   'LOTE_EMISSAO',           // W - lote de emissão do relatório de faturamento (FAT-001, FAT-002…)
   'PERFIL_EMISSAO'          // X - perfil de baixa (BAIXA1…BAIXA5)
