@@ -9,7 +9,7 @@
 // getActiveSpreadsheet() funciona no contexto de script vinculado; openById() funciona no web app (doGet).
 let _SS = null;
 function getSpreadsheet_() {
-  if (!_SS) _SS = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById("1qPJ8c7cq7qb86VJJ-iByeiaPnALOBcDPrPMeL75N2EI");
+  if (!_SS) _SS = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.openById("1dhI8tDOyNCktaoaqyR39xOn6KFNBhYh5eJDfdV-fa_I");
   return _SS;
 }
 const FONTE_SHEET_NAME = "PEDIDOS";
@@ -492,7 +492,7 @@ function obterHistoricoBaixas(uniqueId) {
     // Lê QTD. ABERTA atual da planilha (fresh) para garantir que o modal mostre valor correto
     let qtdAbertaAtual = null;
     try {
-      const ssLive = SpreadsheetApp.openById("1qPJ8c7cq7qb86VJJ-iByeiaPnALOBcDPrPMeL75N2EI");
+      const ssLive = SpreadsheetApp.openById("1dhI8tDOyNCktaoaqyR39xOn6KFNBhYh5eJDfdV-fa_I");
       const dbSheet = ssLive.getSheetByName(DB_SHEET_NAME);
       if (dbSheet) {
         const dbHeaders = dbSheet.getRange(1, 1, 1, dbSheet.getLastColumn()).getValues()[0];
@@ -740,7 +740,7 @@ function estornarBaixa(uniqueId, planilhaLinha, linhaHistorico, qtdEstornada) {
 function aplicarBaixa(uniqueId, planilhaLinha, qtdBaixa, usuarioHtml) {
   try {
     // Abre fresh para evitar leitura em cache de container do Apps Script
-    const ssLive = SpreadsheetApp.openById("1qPJ8c7cq7qb86VJJ-iByeiaPnALOBcDPrPMeL75N2EI");
+    const ssLive = SpreadsheetApp.openById("1dhI8tDOyNCktaoaqyR39xOn6KFNBhYh5eJDfdV-fa_I");
     const sheet = ssLive.getSheetByName(DB_SHEET_NAME);
     const linhaNum = Number(planilhaLinha);
 
@@ -3663,7 +3663,7 @@ function _garantirHeadersRelatorio_DB_() {
 
 function _readAllData_() {
   // Abre a planilha fresh a cada leitura para evitar cache de container do Apps Script
-  const ss = SpreadsheetApp.openById("1qPJ8c7cq7qb86VJJ-iByeiaPnALOBcDPrPMeL75N2EI");
+  const ss = SpreadsheetApp.openById("1dhI8tDOyNCktaoaqyR39xOn6KFNBhYh5eJDfdV-fa_I");
   const sheet = ss.getSheetByName(DB_SHEET_NAME);
   if (!sheet) throw new Error(`Aba '${DB_SHEET_NAME}' não encontrada`);
   const lastRow = sheet.getLastRow();
