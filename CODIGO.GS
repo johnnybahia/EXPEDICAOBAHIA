@@ -1194,8 +1194,10 @@ function verificarEGerarIDs() {
  * Muito mais rápido e confiável que o IMPORTRANGE nativo.
  */
 function importarDadosExternos() {
-  const SOURCE_ID    = '1GtYG4Ahy5XJyJjE37S27u8RyELdRkct8nDAVGIBRI-w';
+  const SOURCE_ID    = '1YoSxArGafauFK8DNf6w9C3CfKGvJ4ECKdMUs2n6Zh58';
   const SOURCE_SHEET = 'RELATÓRIO GERAL DA PRODUÇÃO1';
+  const SOURCE_ROWS  = 6000;
+  const SOURCE_COLS  = 23; // A até W
 
   // Coluna J (índice 9): valores como "82249D" e "14660U" têm formatação customizada
   // no Sheets — getValues() retorna só o número cru (sem sufixo). Por isso usamos
@@ -1207,20 +1209,11 @@ function importarDadosExternos() {
     const sourceSheet = SpreadsheetApp.openById(SOURCE_ID).getSheetByName(SOURCE_SHEET);
     if (!sourceSheet) throw new Error(`Aba "${SOURCE_SHEET}" não encontrada na planilha externa.`);
 
-    // Usa lastRow/lastColumn dinâmico — evita ler 5000 linhas vazias
-    const srcLastRow = sourceSheet.getLastRow();
-    const srcLastCol = sourceSheet.getLastColumn();
-    if (srcLastRow < 1) {
-      Logger.log('⚠️ importarDadosExternos: nenhum dado encontrado na fonte.');
-      return { success: false, erro: 'Sem dados na fonte' };
-    }
-
-    // Leitura única com getValues() — muito mais rápido que getDisplayValues() na range grande
-    const rangeRef = sourceSheet.getRange(1, 1, srcLastRow, srcLastCol);
-    const dados = rangeRef.getValues();
+    // Leitura fixa A1:W6000 — independe de getLastRow()/getLastColumn() da fonte
+    const dados = sourceSheet.getRange(1, 1, SOURCE_ROWS, SOURCE_COLS).getValues();
 
     // Lê display values SOMENTE da coluna J (range de 1 coluna × N linhas = muito menor)
-    const colJDisplay = sourceSheet.getRange(1, COL_J + 1, srcLastRow, 1).getDisplayValues();
+    const colJDisplay = sourceSheet.getRange(1, COL_J + 1, SOURCE_ROWS, 1).getDisplayValues();
 
     // Remove linhas em branco do final
     let ultimaLinha = dados.length;
@@ -1258,13 +1251,10 @@ function importarDadosExternos() {
     destSheet.getRange(1, 1, dadosFiltrados.length, numCols).setValues(dadosFiltrados);
 
     // Copia explícita das colunas X (24) e Y (25) da fonte → DADOS_IMPORTADOS
-    // Necessário pois getLastColumn() pode não detectar colunas sem cabeçalho
-    const srcRowsCopia = Math.min(5000, srcLastRow);
-    if (srcRowsCopia >= 1) {
-      const colXYData = sourceSheet.getRange(1, 24, srcRowsCopia, 2).getValues();
-      destSheet.getRange(1, 24, srcRowsCopia, 2).setValues(colXYData);
-      Logger.log(`✅ Colunas X e Y copiadas da fonte: ${srcRowsCopia} linhas → DADOS_IMPORTADOS cols X/Y`);
-    }
+    // (fora do range A1:W lido acima)
+    const colXYData = sourceSheet.getRange(1, 24, SOURCE_ROWS, 2).getValues();
+    destSheet.getRange(1, 24, SOURCE_ROWS, 2).setValues(colXYData);
+    Logger.log(`✅ Colunas X e Y copiadas da fonte: ${SOURCE_ROWS} linhas → DADOS_IMPORTADOS cols X/Y`);
 
     // Atualiza timestamp em H2 — detectado pelo guard em sincronizarPedidosComFonte()
     const ts = Utilities.formatDate(new Date(), TZ, 'dd/MM/yyyy HH:mm:ss');
