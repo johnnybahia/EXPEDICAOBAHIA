@@ -87,13 +87,14 @@ const ORIG_QTD_COL  = 8;  // I — Quantidade
 const ORIG_DATA_COL = 11; // L — Data
 
 // Colunas da aba "original" usadas para IDENTIFICAR cada item (C,D,E,F,G,H,I,J,K,N).
-// A aba "original" espelha DADOS_IMPORTADOS deslocada 2 colunas (verificado pelas âncoras
-// F=DESC, G=TAM, H=OC, I=QTD, L=DATA RECEB.), logo:
-// C=PEDIDO, D=CÓD. CLIENTE, E=CÓD. MARFIM, F=DESCRIÇÃO, G=TAMANHO,
-// H=ORD. COMPRA, I=QTD, J=LOTE, K=CÓD. OS, N=PRAZO
+// Layout CONFIRMADO com dados reais da planilha (11/06/2026):
+// A=CARTELA, B=CLIENTE, C=PEDIDO, D=CÓD. CLIENTE, E=CÓD. MARFIM, F=DESCRIÇÃO, G=TAMANHO,
+// H=ORD. COMPRA, I=QTD, J=CÓD. OS, K=DATA RECEB., L=DT. ENTREGA, M=PRAZO, N=LOTE, O=PREÇO
+// IMPORTANTE: a aba NÃO tem linha de cabeçalho — os dados começam na linha 1.
 const ORIG_SEQ_KEY_COLS  = [2, 3, 4, 5, 6, 7, 8, 9, 10, 13];
-// Mesmos campos em DADOS_IMPORTADOS (fonteRow, 0-based a partir da col B): índice da original + 1
-const FONTE_SEQ_KEY_COLS = [3, 4, 5, 6, 7, 8, 9, 10, 11, 14];
+// Mesmos campos em DADOS_IMPORTADOS (fonteRow, 0-based a partir da col B):
+// PEDIDO=3, CÓD. CLIENTE=4, MARFIM=5, DESC=6, TAM=7, OC=8, QTD=9, OS=11, DATA RECEB.=12, LOTE=10
+const FONTE_SEQ_KEY_COLS = [3, 4, 5, 6, 7, 8, 9, 11, 12, 10];
 // Apenas itens com DATA RECEB. (data de entrada) a partir desta data recebem sequência
 const SEQUENCIA_DATA_CORTE = new Date(2026, 5, 11); // 11/06/2026
 const DIAS_RETENCAO = 15;      // Itens com status final são purgados após este número de dias
@@ -1498,14 +1499,17 @@ function sincronizarPedidosComFonte(forcarExecucao) {
     const originalSeqFifo = new Map();
     try {
       const origSheet = getSpreadsheet_().getSheetByName(ORIGINAL_SHEET_NAME);
-      if (origSheet && origSheet.getLastRow() > 1) {
-        const origLastRow = origSheet.getLastRow() - 1; // exclui cabeçalho
+      if (origSheet && origSheet.getLastRow() >= 1) {
+        // A aba "original" NÃO tem linha de cabeçalho — os dados começam na linha 1
+        // (confirmado com os dados reais; a leitura antiga a partir da linha 2
+        // descartava o primeiro item da aba).
+        const origLastRow = origSheet.getLastRow();
         // Lê até a coluna N (índice 13) para a chave de identificação da sequência
         const origNumCols = Math.min(Math.max(origSheet.getLastColumn(), 14), origSheet.getMaxColumns());
         if (origNumCols < 14) {
           Logger.log(`⚠️ Aba "${ORIGINAL_SHEET_NAME}" tem só ${origNumCols} colunas (esperado ≥14 para a chave de sequência)`);
         }
-        const origData = origSheet.getRange(2, 1, origLastRow, origNumCols).getValues();
+        const origData = origSheet.getRange(1, 1, origLastRow, origNumCols).getValues();
         const seqContadorOc = {};
         origData.forEach((row, origIdx) => {
           const oc = String(row[ORIG_OC_COL] || '').trim();
@@ -1956,14 +1960,25 @@ function _criarImpressaoDigitalFromRow_(row, offset) {
 // ====== SEQUÊNCIA DA ABA "ORIGINAL" ======
 
 // Normaliza um valor de célula para compor a chave de identificação da sequência:
-// datas → 'yyyy-MM-dd'; números → string canônica (240 ≡ "240" ≡ 240.0);
-// textos → trim + maiúsculas + espaços únicos.
+// datas → 'yyyy-MM-dd' (objeto Date ou texto 'dd/MM/yyyy'); números → string canônica
+// (240 ≡ "240" ≡ "240,00" ≡ "1.028,00"→"1028"); textos → trim + maiúsculas + espaços únicos.
 function _normSeqVal_(v) {
   if (v instanceof Date) {
     return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
   }
   if (typeof v === 'number') return isFinite(v) ? String(v) : '';
   let s = String(v === null || v === undefined ? '' : v).trim().toUpperCase().replace(/\s+/g, ' ');
+  // Data em texto (dd/MM/yyyy) → mesma forma canônica usada para objetos Date
+  const md = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (md) {
+    return md[3] + '-' + String(md[2]).padStart(2, '0') + '-' + String(md[1]).padStart(2, '0');
+  }
+  // Número pt-BR com separador de milhar ("1.028,00") → canônico "1028"
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) {
+    const n = Number(s.replace(/\./g, '').replace(',', '.'));
+    if (isFinite(n)) return String(n);
+  }
+  // Número simples ("240", "12,00", "408.75") → canônico
   if (/^-?\d+(?:[.,]\d+)?$/.test(s)) {
     const n = Number(s.replace(',', '.'));
     if (isFinite(n)) return String(n);
