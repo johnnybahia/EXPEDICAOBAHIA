@@ -5269,6 +5269,7 @@ ALL_OCS_ITEMS = itemsObj;
                                 <th>Dt. Entrega</th>
                                 <th>Prazo</th>
                                 <th>Marcado por</th>
+                                <th>Lote</th>
                             </tr>
                         </thead>
                         <tbody>`;
@@ -5280,6 +5281,7 @@ ALL_OCS_ITEMS = itemsObj;
                     const prazo       = formatarPrazoDias(item.PRAZO);
                     const codOS       = item['CÓD. OS'] ?? 'N/A';
                     const marcadoPor  = _escapeHtml(item.MARCAR_FATURAR_USUARIO || '');
+                    const loteItem    = _escapeHtml(String(item.LOTE ?? '').trim());
                     const loteAnt     = (item.LOTE_EMISSAO || '').trim();
                     // Item reemitido: estava em lote anterior e o usuário optou por incluí-lo novamente
                     const isReemissao = loteAnt && loteAnt !== loteId;
@@ -5300,6 +5302,7 @@ ALL_OCS_ITEMS = itemsObj;
                             <td>${dtEntrega}</td>
                             <td style="text-align:center;">${prazo}</td>
                             <td style="font-size:10px;color:#374151;">${marcadoPor}</td>
+                            <td style="text-align:center;">${loteItem}</td>
                         </tr>`;
                 });
 
