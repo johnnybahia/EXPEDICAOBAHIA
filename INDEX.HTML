@@ -746,6 +746,19 @@
         <!-- Filtro de Marfim (fixo: apenas CM) -->
         <input type="radio" name="marfim-filter-ponteiras" value="cm" checked style="display:none;">
 
+        <!-- Tipo de relatório: detalhado (atual) ou agrupado por Cód. Marfim + Tamanho -->
+        <div style="margin-bottom: 1rem; padding: 0.75rem; background: #fffbeb; border: 2px solid #f59e0b; border-radius: 6px;">
+          <div style="font-weight: 600; color: #92400e; margin-bottom: 0.5rem;">Tipo de relatório:</div>
+          <label style="display: flex; align-items: flex-start; gap: 0.5rem; cursor: pointer; margin-bottom: 0.4rem;">
+            <input type="radio" name="tipo-relatorio-ponteiras" value="detalhado" checked style="margin-top: 3px; cursor: pointer;">
+            <span><strong>Detalhado</strong> — um item por linha (relatório atual)</span>
+          </label>
+          <label style="display: flex; align-items: flex-start; gap: 0.5rem; cursor: pointer;">
+            <input type="radio" name="tipo-relatorio-ponteiras" value="agrupado" style="margin-top: 3px; cursor: pointer;">
+            <span><strong>Agrupado</strong> — itens do mesmo pedido com Cód. Marfim e Tamanho iguais viram uma linha só, com o Saldo Aberto somado e as OS listadas na mesma célula</span>
+          </label>
+        </div>
+
         <!-- Campo de busca -->
         <div style="margin-bottom: 1rem;">
           <input
@@ -4331,12 +4344,14 @@ ALL_OCS_ITEMS = itemsObj;
 
     function gerarRelatorioPonteiras() {
         const marfimFilter = document.querySelector('input[name="marfim-filter-ponteiras"]:checked').value;
+        const tipoRadio    = document.querySelector('input[name="tipo-relatorio-ponteiras"]:checked');
+        const agrupado     = tipoRadio ? tipoRadio.value === 'agrupado' : false;
         $relatorioPonteirasModal.classList.add('hidden');
-        _imprimirRelatorioPonteiras(marfimFilter);
+        _imprimirRelatorioPonteiras(marfimFilter, agrupado);
     }
 
     // Monta e imprime o relatório com o mapa {uniqueId → qtdPedidos} já resolvido
-    function _imprimirRelatorioPonteiras(marfimFilter) {
+    function _imprimirRelatorioPonteiras(marfimFilter, agrupado) {
         const printWindow = window.open('', '_blank');
 
         let html = `
@@ -4344,7 +4359,7 @@ ALL_OCS_ITEMS = itemsObj;
         <html>
         <head>
             <meta charset="UTF-8">
-            <title>Relatório Ponteiras</title>
+            <title>Relatório Ponteiras${agrupado ? ' — Agrupado' : ''}</title>
             <style>
                 * { margin: 0; padding: 0; box-sizing: border-box; }
                 body { font-family: Arial, sans-serif; font-size: 13px; orphans: 3; widows: 3; }
@@ -4371,8 +4386,8 @@ ALL_OCS_ITEMS = itemsObj;
             </style>
         </head>
         <body>
-            <h1>📌 Relatório Ponteiras</h1>
-            <div class="info">Gerado em: ${new Date().toLocaleDateString('pt-BR')} às ${new Date().toLocaleTimeString('pt-BR')}<br>Filtro: ${marfimFilter === 'all' ? 'Todos (CM + MM)' : marfimFilter === 'cm' ? 'Apenas CM' : 'Apenas MM'}</div>
+            <h1>📌 Relatório Ponteiras${agrupado ? ' — Agrupado' : ''}</h1>
+            <div class="info">Gerado em: ${new Date().toLocaleDateString('pt-BR')} às ${new Date().toLocaleTimeString('pt-BR')}<br>Filtro: ${marfimFilter === 'all' ? 'Todos (CM + MM)' : marfimFilter === 'cm' ? 'Apenas CM' : 'Apenas MM'}${agrupado ? '<br><b>Modo: Agrupado por Cód. Marfim + Tamanho (Saldo Aberto somado)</b>' : ''}</div>
         `;
 
         // Funções auxiliares
@@ -4391,6 +4406,53 @@ ALL_OCS_ITEMS = itemsObj;
                 const tB = _parseTamanhoNum(b.TAMANHO);
                 if (tA !== tB) return tA - tB;
                 return _parseDateMs(a['DT. ENTREGA']) - _parseDateMs(b['DT. ENTREGA']);
+            });
+        }
+        // Conversão numérica rigorosa para a soma do modo agrupado.
+        // Retorna null para valor não numérico — NUNCA assume 0 em silêncio: a linha
+        // passa a exibir "CONFERIR" em vez de um total potencialmente errado.
+        function _qtdNumericaPonteiras(v) {
+            if (typeof v === 'number') return isFinite(v) ? v : null;
+            if (v === null || v === undefined) return null;
+            let s = String(v).trim();
+            if (!s) return null;
+            if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(s)) s = s.replace(/\./g, '').replace(',', '.');
+            else s = s.replace(',', '.');
+            if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+            const n = Number(s);
+            return isFinite(n) ? n : null;
+        }
+        // Modo agrupado: funde itens com mesmo CÓD. MARFIM + TAMANHO em uma linha,
+        // somando QTD. ABERTA e acumulando as OS (cada uma com sua qtd) em _osList,
+        // para que a soma seja conferível no próprio relatório.
+        // Itens sem Cód. Marfim ou Tamanho válidos nunca são fundidos (linha própria).
+        // Dt. Recebimento exibida é a mais antiga entre os itens agrupados.
+        function _agruparItensPonteiras(itens) {
+            const grupos = new Map();
+            let soloSeq = 0;
+            itens.forEach(function(item) {
+                const marfim = String(item['CÓD. MARFIM'] || '').trim().toUpperCase();
+                const tam    = String(item.TAMANHO || '').trim().toUpperCase();
+                const chaveConfiavel = marfim && marfim !== 'N/A' && tam && tam !== 'N/A';
+                const key = chaveConfiavel ? marfim + '|' + tam : '__solo__' + (soloSeq++);
+                if (!grupos.has(key)) {
+                    grupos.set(key, Object.assign({}, item, {
+                        _qtdTotal: 0, _qtdInvalida: false, _osList: [], _dtRecebMs: Infinity
+                    }));
+                }
+                const g = grupos.get(key);
+                const qtdNum = _qtdNumericaPonteiras(item['QTD. ABERTA']);
+                if (qtdNum === null) g._qtdInvalida = true;
+                else g._qtdTotal += qtdNum;
+                g._osList.push({ os: (item['CÓD. OS'] ?? 'N/A').toString(), qtd: qtdNum });
+                const recMs = _parseDateMs(item['DATA RECEB.']);
+                if (recMs < g._dtRecebMs) { g._dtRecebMs = recMs; g['DATA RECEB.'] = item['DATA RECEB.']; }
+            });
+            return [...grupos.values()].map(function(g) {
+                // Arredonda a 2 casas só para eliminar resíduo binário de somas fracionadas;
+                // somas de inteiros permanecem exatas.
+                g['QTD. ABERTA'] = Math.round((g._qtdTotal + Number.EPSILON) * 100) / 100;
+                return g;
             });
         }
 
@@ -4451,6 +4513,7 @@ ALL_OCS_ITEMS = itemsObj;
 
         blocos.forEach(function({ ocNum, ocData, ocInfo, nomeCliente, itens, dtMs, numeroCliente }) {
             itens = _sortItensPonteiras(itens);
+            if (agrupado) itens = _agruparItensPonteiras(itens);
 
             const temInativos  = itens.some(i => i.Status?.toLowerCase() === 'inativo');
             let avisos = [];
@@ -4500,7 +4563,27 @@ ALL_OCS_ITEMS = itemsObj;
                 const oc      = (item['ORD. COMPRA']  || ocNum).toString();
                 const tam     = (item.TAMANHO || '').toString();
                 const qtd     = item['QTD. ABERTA'] ?? 0;
-                const os      = (item['CÓD. OS'] ?? 'N/A').toString();
+                const escTxt  = v => String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                // Modo agrupado: _osList traz as OS dos itens fundidos nesta linha, cada
+                // uma com sua quantidade entre parênteses, para a soma ser conferível.
+                const ehLinhaAgrupada = !!(item._osList && item._osList.length > 1);
+                let osHtml, qtdHtml;
+                if (ehLinhaAgrupada) {
+                    osHtml = item._osList
+                        .map(e => escTxt(e.os) + ` <span style="font-size:9px;color:#6b7280;">(${e.qtd === null ? '?' : escTxt(e.qtd)})</span>`)
+                        .join('<br>');
+                    qtdHtml = item._qtdInvalida
+                        ? '<b style="color:#dc2626;">⚠️ CONFERIR</b>'
+                        : `<b>${escTxt(qtd)}</b> <span style="font-size:9px;color:#92400e;font-weight:600;">(${item._osList.length} itens)</span>`;
+                } else {
+                    const osUnica = (item._osList && item._osList.length === 1)
+                        ? item._osList[0].os
+                        : (item['CÓD. OS'] ?? 'N/A').toString();
+                    osHtml  = escTxt(osUnica);
+                    qtdHtml = item._qtdInvalida
+                        ? '<b style="color:#dc2626;">⚠️ CONFERIR</b>'
+                        : `${qtd}`;
+                }
                 const dtRec   = formatarData(item['DATA RECEB.']);
                 const dtEnt   = formatarData(item['DT. ENTREGA']);
                 const prazo   = formatarPrazoDias(item.PRAZO);
@@ -4512,8 +4595,8 @@ ALL_OCS_ITEMS = itemsObj;
                                 <td>${descEsc}</td>
                                 <td>${tam}</td>
                                 <td>${oc}</td>
-                                <td>${qtd}</td>
-                                <td>${os}</td>
+                                <td>${qtdHtml}</td>
+                                <td>${osHtml}</td>
                                 <td>${dtRec}</td>
                                 <td>${dtEnt}</td>
                                 <td>${prazo}</td>
