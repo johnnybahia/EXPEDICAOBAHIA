@@ -4656,6 +4656,7 @@ ALL_OCS_ITEMS = itemsObj;
                 .oc-header { background: #f3f4f6; padding: 8px; border: 2px solid #d1d5db; margin-bottom: 8px; }
                 .oc-header.faturado-pending { background: #fef2f2; border-color: #dc2626; }
                 .oc-title { font-size: 15px; font-weight: bold; margin-bottom: 4px; }
+                .oc-marca { font-size: 12px; font-weight: 700; color: #1e40af; background: #dbeafe; border-radius: 4px; padding: 1px 8px; margin-left: 6px; vertical-align: middle; }
                 .oc-avisos { color: #dc2626; font-weight: bold; font-size: 12px; }
                 table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
                 th { background: #374151; color: white; padding: 7px 4px; text-align: left; font-size: 11px; border: 1px solid #111; }
@@ -4775,10 +4776,13 @@ ALL_OCS_ITEMS = itemsObj;
             if (temFaturados) avisos.push('⚠️ Contém itens Faturados');
             if (temInativos) avisos.push('⚠️ Contém itens Inativos');
 
+            const marcaCliente = _chaveAgrupamentoFatur(itens[0] || {});
+            const marcaLabel = marcaCliente && marcaCliente !== '(Sem Referência)' ? marcaCliente : '';
+
             html += `
                 <div class="oc-section">
                     <div class="oc-header ${temFaturados ? 'faturado-pending' : ''}">
-                        <div class="oc-title">OC: ${ocNum} - ${nomeCliente}</div>
+                        <div class="oc-title">OC: ${ocNum} - ${nomeCliente}${marcaLabel ? ` <span class="oc-marca">📋 ${marcaLabel}</span>` : ''}</div>
                         ${avisos.length > 0 ? `<div class="oc-avisos">${avisos.join(' | ')}</div>` : ''}
                     </div>
                     <table>
