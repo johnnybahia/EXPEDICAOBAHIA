@@ -5293,7 +5293,8 @@ ALL_OCS_ITEMS = itemsObj;
                 .info-filtro { display: inline-block; margin-top: 3px; font-size: 10px; color: #1e40af; font-weight: 600; }
                 .info-lote { display: inline-block; margin-top: 4px; font-size: 13px; font-weight: 800; color: #b45309; background: #fef3c7; border: 2px solid #f59e0b; border-radius: 6px; padding: 2px 12px; letter-spacing: 0.04em; }
                 .grupo-section { margin-bottom: 28px; }
-                .grupo-header { background: #1e40af; color: white; padding: 9px 12px; border-radius: 6px 6px 0 0; font-size: 15px; font-weight: bold; letter-spacing: 0.3px; }
+                .grupo-header { background: #1e40af; color: white; padding: 9px 12px; border-radius: 6px 6px 0 0; font-size: 15px; font-weight: bold; letter-spacing: 0.3px; display: flex; justify-content: space-between; align-items: center; }
+                .grupo-pagina { font-size: 11px; font-weight: 700; color: #dbeafe; background: rgba(255,255,255,0.15); border-radius: 4px; padding: 2px 8px; }
                 .grupo-body { border: 2px solid #1e40af; border-top: none; border-radius: 0 0 6px 6px; padding: 10px; background: #f0f7ff; }
                 .oc-section { page-break-inside: avoid; margin-bottom: 14px; background: #f0fdf4; padding: 8px; border: 2px solid #22c55e; border-radius: 6px; }
                 .oc-header { background: #dcfce7; padding: 8px; border: 2px solid #16a34a; margin-bottom: 8px; border-radius: 4px; }
@@ -5307,7 +5308,11 @@ ALL_OCS_ITEMS = itemsObj;
                 .reemissao td { color: #78350f; }
                 .badge-reemissao { font-size: 9px; font-weight: 700; background: #f59e0b; color: #1c1917; border-radius: 4px; padding: 1px 5px; margin-left: 4px; vertical-align: middle; }
                 @media print {
-                    @page { size: A4 landscape; margin: 0.8cm; }
+                    @page {
+                        size: A4 landscape;
+                        margin: 0.8cm 0.8cm 1.2cm 0.8cm;
+                        @bottom-right { content: "Página " counter(page) " de " counter(pages); font-size: 9px; color: #555; }
+                    }
                     body { margin: 0; padding: 0; }
                     h1, .info { page-break-after: avoid; page-break-inside: avoid; }
                     .oc-section { page-break-inside: avoid; }
@@ -5326,12 +5331,12 @@ ALL_OCS_ITEMS = itemsObj;
             </div>
         `;
 
-        gruposOrdenados.forEach(infoX => {
+        gruposOrdenados.forEach((infoX, grupoIdx) => {
             const ocsPorGrupo  = gruposPorInfoX[infoX];
             const ocsOrdenadas = Object.keys(ocsPorGrupo).sort();
 
             html += `<div class="grupo-section">
-                <div class="grupo-header">📋 ${infoX}</div>
+                <div class="grupo-header">📋 ${infoX} <span class="grupo-pagina">Pág. ${grupoIdx + 1} de ${gruposOrdenados.length}</span></div>
                 <div class="grupo-body">`;
 
             ocsOrdenadas.forEach(ocNum => {
