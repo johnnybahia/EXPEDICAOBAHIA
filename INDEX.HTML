@@ -5066,6 +5066,29 @@ ALL_OCS_ITEMS = itemsObj;
         _mostrarFiltroMarca(itensFiltrados);
     }
 
+    // Converte DT. ENTREGA (serial Excel, Date, dd/MM/yyyy ou ISO) em timestamp para ordenação.
+    // Datas ausentes/inválidas retornam Infinity para irem ao final da lista.
+    function _tsDataEntrega(valor) {
+        if (valor === null || valor === undefined || valor === '') return Infinity;
+        try {
+            if (typeof valor === 'number') {
+                const excelEpoch = new Date(1899, 11, 30);
+                return excelEpoch.getTime() + (valor * 86400000);
+            }
+            if (valor instanceof Date) {
+                const t = valor.getTime();
+                return isNaN(t) ? Infinity : t;
+            }
+            const s = String(valor).trim();
+            const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+            if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])).getTime();
+            const t = new Date(s).getTime();
+            return isNaN(t) ? Infinity : t;
+        } catch (e) {
+            return Infinity;
+        }
+    }
+
     // Para clientes Dakota, cada nome de cliente é tratado como uma "marca" separada
     function _chaveAgrupamentoFatur(item) {
         if ((item.CLIENTE || '').toUpperCase().includes('DAKOTA')) {
@@ -5263,7 +5286,11 @@ ALL_OCS_ITEMS = itemsObj;
             const oc    = item['ORD. COMPRA'] || 'SEM OC';
             if (!gruposPorInfoX[infoX]) gruposPorInfoX[infoX] = {};
             if (!gruposPorInfoX[infoX][oc]) {
-                gruposPorInfoX[infoX][oc] = { cliente: item.CLIENTE || 'SEM CLIENTE', itens: [] };
+                gruposPorInfoX[infoX][oc] = {
+                    cliente: item.CLIENTE || 'SEM CLIENTE',
+                    marca: (item.INFO_X || '').trim(),
+                    itens: []
+                };
             }
             gruposPorInfoX[infoX][oc].itens.push(item);
         });
@@ -5332,8 +5359,38 @@ ALL_OCS_ITEMS = itemsObj;
         `;
 
         gruposOrdenados.forEach((infoX, grupoIdx) => {
-            const ocsPorGrupo  = gruposPorInfoX[infoX];
-            const ocsOrdenadas = Object.keys(ocsPorGrupo).sort();
+            const ocsPorGrupo = gruposPorInfoX[infoX];
+
+            // Ordena as OCs mantendo cada cliente em sequência (sem misturar clientes
+            // da mesma marca) e, dentro de cada cliente, da menor para a maior
+            // data de entrega. Os blocos de clientes também são ordenados pela
+            // menor data de entrega de cada cliente.
+            const menorEntregaPorOc      = {};
+            const menorEntregaPorCliente = {};
+            Object.keys(ocsPorGrupo).forEach(oc => {
+                const ocData = ocsPorGrupo[oc];
+                const minOc  = Math.min(...ocData.itens.map(it => _tsDataEntrega(it['DT. ENTREGA'])));
+                menorEntregaPorOc[oc] = minOc;
+                const cli = ocData.cliente;
+                if (!(cli in menorEntregaPorCliente) || minOc < menorEntregaPorCliente[cli]) {
+                    menorEntregaPorCliente[cli] = minOc;
+                }
+            });
+
+            const ocsOrdenadas = Object.keys(ocsPorGrupo).sort((a, b) => {
+                const cliA = ocsPorGrupo[a].cliente;
+                const cliB = ocsPorGrupo[b].cliente;
+                if (cliA !== cliB) {
+                    // Blocos de clientes ordenados pela menor data de entrega do cliente
+                    const dCli = menorEntregaPorCliente[cliA] - menorEntregaPorCliente[cliB];
+                    if (dCli !== 0 && !isNaN(dCli)) return dCli;
+                    return cliA.localeCompare(cliB, 'pt-BR');
+                }
+                // Mesmo cliente: OCs da menor para a maior data de entrega
+                const dOc = menorEntregaPorOc[a] - menorEntregaPorOc[b];
+                if (dOc !== 0 && !isNaN(dOc)) return dOc;
+                return a.localeCompare(b, 'pt-BR');
+            });
 
             html += `<div class="grupo-section">
                 <div class="grupo-header">📋 ${infoX} <span class="grupo-pagina">Pág. ${grupoIdx + 1} de ${gruposOrdenados.length}</span></div>
@@ -5341,12 +5398,19 @@ ALL_OCS_ITEMS = itemsObj;
 
             ocsOrdenadas.forEach(ocNum => {
                 const ocData = ocsPorGrupo[ocNum];
-                const itens  = ocData.itens;
+                // Itens da OC em ordem crescente de data de entrega
+                const itens  = ocData.itens.slice().sort((a, b) =>
+                    _tsDataEntrega(a['DT. ENTREGA']) - _tsDataEntrega(b['DT. ENTREGA']) || 0
+                );
+                // Marca exibida ao lado do nome do cliente (quando não for redundante)
+                const marcaOc = ocData.marca && ocData.marca !== ocData.cliente
+                    ? ` - ${ocData.marca}`
+                    : '';
 
                 html += `
                 <div class="oc-section">
                     <div class="oc-header">
-                        <div class="oc-title">OC: ${ocNum} - ${ocData.cliente}</div>
+                        <div class="oc-title">OC: ${ocNum} - ${ocData.cliente}${marcaOc}</div>
                     </div>
                     <table>
                         <thead>
