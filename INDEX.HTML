@@ -5338,7 +5338,7 @@ ALL_OCS_ITEMS = itemsObj;
                     @page {
                         size: A4 landscape;
                         margin: 0.8cm 0.8cm 1.2cm 0.8cm;
-                        @bottom-right { content: "Página " counter(page) " de " counter(pages); font-size: 9px; color: #555; }
+                        @bottom-right { content: "Página " counter(page) " de " counter(pages); font-size: 11px; font-weight: bold; color: #333; }
                     }
                     body { margin: 0; padding: 0; }
                     h1, .info { page-break-after: avoid; page-break-inside: avoid; }
@@ -5393,7 +5393,7 @@ ALL_OCS_ITEMS = itemsObj;
             });
 
             html += `<div class="grupo-section">
-                <div class="grupo-header">📋 ${infoX} <span class="grupo-pagina">Pág. ${grupoIdx + 1} de ${gruposOrdenados.length}</span></div>
+                <div class="grupo-header">📋 ${infoX} <span class="grupo-pagina">Marca ${grupoIdx + 1} de ${gruposOrdenados.length}</span></div>
                 <div class="grupo-body">`;
 
             ocsOrdenadas.forEach(ocNum => {
