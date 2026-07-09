@@ -170,6 +170,12 @@
     .filtro-fatur-lista li.sem-itens .filtro-fatur-nome { color: #9ca3af; }
     .filtro-fatur-count { font-size: 0.72rem; font-weight: 700; padding: 2px 7px; border-radius: 9999px; background: #16a34a; color: white; white-space: nowrap; }
 
+    /* === MODAL FILTRO DE CLIENTES PARA FATURAMENTO === */
+    #filtroClienteFaturModal { z-index: 3050; }
+    #filtroClienteFaturModal .modal-content { max-width: 480px; }
+    #filtroClienteFaturModal .modal-header { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border-bottom-color: #fde047; }
+    #filtroClienteFaturModal .modal-header h2 { color: #854d0e; font-size: 1.1rem; }
+
     /* === MODAL FILTRO DE MARCAS PARA FATURAMENTO === */
     #filtroMarcaFaturModal { z-index: 3100; }
     #filtroMarcaFaturModal .modal-content { max-width: 480px; }
@@ -1052,6 +1058,27 @@
       <div class="modal-footer">
         <button class="modal-btn modal-btn-cancel" onclick="_fecharFiltroFatur()">Cancelar</button>
         <button class="modal-btn modal-btn-confirm" onclick="_confirmarFiltroFatur()">Próximo →</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: filtro de clientes para relatório de faturamento -->
+  <div id="filtroClienteFaturModal" class="modal-overlay hidden">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2>👥 Filtrar Clientes — Relatório de Faturamento</h2>
+      </div>
+      <div class="modal-body">
+        <div class="filtro-fatur-atalhos">
+          <button onclick="_filtroClienteSelecionarTodos()">Marcar todos</button>
+          <button onclick="_filtroClienteDesmarcarTodos()">Desmarcar todos</button>
+        </div>
+        <ul id="filtroClienteLista" class="filtro-fatur-lista"></ul>
+        <p class="filtro-fatur-aviso">Só as marcas dos clientes marcados aparecem na próxima etapa.</p>
+      </div>
+      <div class="modal-footer">
+        <button class="modal-btn modal-btn-cancel" onclick="_voltarFiltroCliente()">← Voltar</button>
+        <button class="modal-btn modal-btn-confirm" onclick="_confirmarFiltroCliente()">Próximo →</button>
       </div>
     </div>
   </div>
@@ -2251,7 +2278,7 @@ ALL_OCS_ITEMS = itemsObj;
             const _isParcial = window.ACCESS_NIVEL === 'PARCIAL';
             const _acoesHeader = _isParcial ? '' : '<th title="Selecionar para lote de etiquetas" style="font-size:0.75em;line-height:1.2;">📦 Etiquetas<br>em lote</th><th>Ações</th>';
             bodyHtml = `<div class="overflow-x-auto"><table class="item-table"><thead><tr>
-                            <th>Cartela</th><th>Cód. Cliente</th><th class="description-col">Descrição</th>
+                            <th>Cartela</th><th>Cód. Cliente</th><th>Cód. Marfim</th><th class="description-col">Descrição</th>
                             <th>Tamanho</th><th>Saldo Aberto</th><th class="qtd-aberta">Qtd. Aberta</th><th>OS</th>
                             <th>Dt. Recebimento</th><th>Dt. Entrega</th><th class="status-prazo">Prazo</th>
                             <th>Lote</th>
@@ -2291,6 +2318,7 @@ ALL_OCS_ITEMS = itemsObj;
                 bodyHtml += `
                         <td class="nowrap">${item.CARTELA ?? 'N/A'}</td>
                         <td class="nowrap">${item['CÓD. CLIENTE'] ?? 'N/A'}</td>
+                        <td class="nowrap">${item['CÓD. MARFIM'] ?? 'N/A'}</td>
                         <td class="description-col">${item.DESCRIÇÃO ?? 'N/A'}</td>
                         <td class="nowrap">${item.TAMANHO ?? 'N/A'}</td>
                         <td class="nowrap">${fmtInt(qtdOriginal)}</td>
@@ -5063,6 +5091,112 @@ ALL_OCS_ITEMS = itemsObj;
         _filtroFaturUsuariosSelecionados = [...selecionados];
 
         _fecharFiltroFatur();
+        _mostrarFiltroCliente(itensFiltrados);
+    }
+
+    // ===== ETAPA: FILTRO DE CLIENTE =====
+    // Conjunto de itens que a etapa de marca usa como base (já restrito ao cliente escolhido)
+    let _filtroFaturBaseMarca = [];
+    // Indica se o modal de cliente chegou a ser exibido (controla o "← Voltar" da etapa de marca)
+    let _filtroClienteExibido = false;
+
+    // Coleta os clientes distintos dos itens (já filtrados por usuário) e exibe o
+    // modal de seleção de cliente. Havendo um único cliente, pula direto para o
+    // filtro de marcas.
+    function _mostrarFiltroCliente(itens) {
+        const contagem = new Map();
+        itens.forEach(item => {
+            const nome = (item.CLIENTE || '').trim() || 'SEM CLIENTE';
+            contagem.set(nome, (contagem.get(nome) || 0) + 1);
+        });
+
+        // Um único cliente: nada a escolher, segue direto para as marcas
+        if (contagem.size <= 1) {
+            _filtroClienteExibido = false;
+            _filtroFaturBaseMarca = itens;
+            _mostrarFiltroMarca(itens);
+            return;
+        }
+
+        _filtroClienteExibido = true;
+
+        const $lista = document.getElementById('filtroClienteLista');
+        $lista.innerHTML = '';
+
+        const clientesOrdenados = [...contagem.keys()].sort((a, b) => {
+            if (a === 'SEM CLIENTE') return 1;
+            if (b === 'SEM CLIENTE') return -1;
+            return a.localeCompare(b, 'pt-BR', { sensitivity: 'base' });
+        });
+
+        clientesOrdenados.forEach(nome => {
+            const count   = contagem.get(nome);
+            const nomeEsc = _escapeHtml(nome);
+            const li = document.createElement('li');
+            li.innerHTML = `
+                <input type="checkbox" checked data-cliente="${nomeEsc}">
+                <span class="filtro-fatur-nome">${nomeEsc}</span>
+                <span class="filtro-fatur-count">${count} ${count === 1 ? 'item' : 'itens'}</span>`;
+            li.querySelector('input').addEventListener('change', function() {
+                li.style.opacity = this.checked ? '1' : '0.5';
+            });
+            li.addEventListener('click', function(e) {
+                if (e.target.tagName !== 'INPUT') {
+                    const cb = li.querySelector('input');
+                    cb.checked = !cb.checked;
+                    cb.dispatchEvent(new Event('change'));
+                }
+            });
+            $lista.appendChild(li);
+        });
+
+        document.getElementById('filtroClienteFaturModal').classList.remove('hidden');
+    }
+
+    function _filtroClienteSelecionarTodos() {
+        document.querySelectorAll('#filtroClienteLista input[type=checkbox]').forEach(cb => {
+            cb.checked = true;
+            cb.closest('li').style.opacity = '1';
+        });
+    }
+
+    function _filtroClienteDesmarcarTodos() {
+        document.querySelectorAll('#filtroClienteLista input[type=checkbox]').forEach(cb => {
+            cb.checked = false;
+            cb.closest('li').style.opacity = '0.5';
+        });
+    }
+
+    // Volta do filtro de clientes para o filtro de usuários
+    function _voltarFiltroCliente() {
+        document.getElementById('filtroClienteFaturModal').classList.add('hidden');
+        document.getElementById('filtroUsuarioFaturModal').classList.remove('hidden');
+    }
+
+    function _confirmarFiltroCliente() {
+        const selecionados = new Set();
+        document.querySelectorAll('#filtroClienteLista input[type=checkbox]:checked').forEach(cb => {
+            selecionados.add(cb.dataset.cliente);
+        });
+
+        if (selecionados.size === 0) {
+            showError('Selecione ao menos um cliente para imprimir.');
+            return;
+        }
+
+        // Filtra sempre a partir do conjunto por usuário (permite voltar e trocar de cliente)
+        const itensFiltrados = _filtroFaturItensSelecionados.filter(item => {
+            const nome = (item.CLIENTE || '').trim() || 'SEM CLIENTE';
+            return selecionados.has(nome);
+        });
+
+        if (itensFiltrados.length === 0) {
+            showError('Nenhum item encontrado para os clientes selecionados.');
+            return;
+        }
+
+        _filtroFaturBaseMarca = itensFiltrados;
+        document.getElementById('filtroClienteFaturModal').classList.add('hidden');
         _mostrarFiltroMarca(itensFiltrados);
     }
 
@@ -5210,7 +5344,12 @@ ALL_OCS_ITEMS = itemsObj;
 
     function _voltarFiltroFatur() {
         document.getElementById('filtroMarcaFaturModal').classList.add('hidden');
-        document.getElementById('filtroUsuarioFaturModal').classList.remove('hidden');
+        // Volta para a etapa de cliente se ela foi exibida; senão, para a de usuários
+        if (_filtroClienteExibido) {
+            document.getElementById('filtroClienteFaturModal').classList.remove('hidden');
+        } else {
+            document.getElementById('filtroUsuarioFaturModal').classList.remove('hidden');
+        }
     }
 
     function _confirmarFiltroMarca() {
@@ -5225,7 +5364,7 @@ ALL_OCS_ITEMS = itemsObj;
             return;
         }
 
-        const itensFiltrados = _filtroFaturItensSelecionados.filter(item => {
+        const itensFiltrados = _filtroFaturBaseMarca.filter(item => {
             const marca = _chaveAgrupamentoFatur(item);
             const lote  = (item.LOTE_EMISSAO || '').trim();
             return selecionadas.has(`${marca}||${lote}`);
