@@ -67,6 +67,8 @@ const PEDIDOS_LOTE_COL          = 20; // U (coluna 21) — número de lote da co
 const DB_LOTE_COL               = 20; // U (coluna 21) — número de lote propagado do PEDIDOS para o Relatorio_DB
 const PEDIDOS_SEQ_ORIGINAL_COL  = 21; // V (coluna 22) — sequência do item dentro da OC conforme aba "original" (fixa, nunca recalculada)
 const DB_SEQUENCIA_COL          = 24; // Y (coluna 25) — sequência propagada do PEDIDOS para o Relatorio_DB (fixa)
+const PEDIDOS_COLY_COL          = 22; // W (coluna 23) — campo da coluna Y da fonte (informação adicional da OC, exibida junto da marca)
+const DB_COLY_COL               = 25; // Z (coluna 26) — campo da coluna Y propagado do PEDIDOS para o Relatorio_DB
 const LOTE_DILLY_SHEET_NAME     = 'LOTE DILLY'; // aba com mapeamento OC→Lote para o cliente Dilly
 
 // Mapeamento DADOS_IMPORTADOS (fonteRow, a partir da col B) → PEDIDOS (a partir da col A).
@@ -1353,7 +1355,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
     }
 
     // Lê dados da fonte a partir da coluna B (dados começam em B, coluna A ignorada)
-    // Garante pelo menos 24 colunas (B→Y) para cobrir fonteRow[22] = col X = INFO_X
+    // Garante pelo menos 24 colunas (B→Y) para cobrir fonteRow[22]=col X=INFO_X e fonteRow[23]=col Y=INFO_Y
     const fonteNumCols = Math.max(fonteSheet.getLastColumn() - 1, 24);
     const fonteData = fonteSheet.getRange(FONTE_DATA_START_ROW, 2, fonteLastRow - FONTE_DATA_START_ROW + 1, fonteNumCols).getValues();
     Logger.log(`📥 Leu ${fonteData.length} linhas de ${IMPORTRANGE_SHEET_NAME}`);
@@ -1819,7 +1821,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         }
       }
 
-      // Monta linha completa para PEDIDOS (A até T)
+      // Monta linha completa para PEDIDOS (A até W)
       const novaLinha = [
         idFinal,           // A: ID_UNICO
         fonteRow[0],       // B: CARTELA
@@ -1842,7 +1844,8 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         codigoFixo,        // S: CÓDIGO_FIXO — UUID imutável por item
         fonteRow[22] !== undefined ? fonteRow[22] : '',  // T: INFO_X — coluna X da fonte (informação adicional da OC)
         fonteRow[10] !== undefined ? fonteRow[10] : '',  // U: LOTE — coluna L da fonte (número de lote)
-        seqOriginal        // V: SEQ_ORIGINAL — posição do item dentro da OC na aba "original" (fixa)
+        seqOriginal,       // V: SEQ_ORIGINAL — posição do item dentro da OC na aba "original" (fixa)
+        fonteRow[23] !== undefined ? fonteRow[23] : ''   // W: INFO_Y — coluna Y da fonte (informação adicional da OC, exibida junto da marca)
       ];
 
       novasPedidosData.push(novaLinha);
@@ -1867,9 +1870,10 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       pedidosSheet.getRange(1, 6,  rowsToFormat, 2).setNumberFormat(txtFmt); // F, G
       pedidosSheet.getRange(1, 12, rowsToFormat, 1).setNumberFormat(txtFmt); // L
       pedidosSheet.getRange(1, 20, rowsToFormat, 2).setNumberFormat(txtFmt); // T (INFO_X), U (LOTE)
+      pedidosSheet.getRange(1, 23, rowsToFormat, 1).setNumberFormat(txtFmt); // W (INFO_Y)
 
-      // Escreve novos dados (22 colunas: A–V, incluindo SEQ_ORIGINAL em V)
-      pedidosSheet.getRange(FONTE_DATA_START_ROW, 1, novasPedidosData.length, 22).setValues(novasPedidosData);
+      // Escreve novos dados (23 colunas: A–W, incluindo SEQ_ORIGINAL em V e INFO_Y em W)
+      pedidosSheet.getRange(FONTE_DATA_START_ROW, 1, novasPedidosData.length, 23).setValues(novasPedidosData);
 
       SpreadsheetApp.flush();
 
@@ -3382,6 +3386,17 @@ function sincronizarDados() {
       Logger.log(`   ⚠️ Erro ao propagar sequências para o DB: ${eSeq.message}`);
     }
 
+    // Propaga INFO_Y (PEDIDOS col W) para INFO_Y (Relatorio_DB col Z).
+    // Usa fonteData (todas as linhas de PEDIDOS, inclusive as já correspondidas) — o fonteMap
+    // aqui só contém itens novos, pois os correspondidos foram removidos durante a sincronização.
+    // Atualiza sempre a partir da fonte; itens fora do PEDIDOS mantêm o valor já gravado.
+    try {
+      const infoYGravadas = _propagarInfoYParaDB_(dbSheet, fonteData);
+      if (infoYGravadas > 0) Logger.log(`   🏷️ ${infoYGravadas} INFO_Y (coluna Y da fonte) atualizado(s) no DB (col Z)`);
+    } catch (eInfoY) {
+      Logger.log(`   ⚠️ Erro ao propagar INFO_Y para o DB: ${eInfoY.message}`);
+    }
+
     SpreadsheetApp.flush();
     if (novosValidados.length > 0 || updates.length > 0) {
       limparCache();
@@ -3482,6 +3497,68 @@ function _propagarSequenciaOriginalParaDB_(dbSheet, fonteMap) {
     dbSheet.getRange(2, DB_SEQUENCIA_COL + 1, numRows, 1).setValues(colY);
   }
   return gravadas;
+}
+
+/**
+ * Propaga o INFO_Y (PEDIDOS col W) para o Relatorio_DB (col Z).
+ * Diferente da sequência (imutável), o INFO_Y acompanha a fonte:
+ *  - Itens presentes em PEDIDOS recebem o valor atual da fonte.
+ *  - Itens ausentes de PEDIDOS (ex: já faturados e fora da fonte) mantêm o valor já gravado.
+ *  - Se a coluna Z tiver cabeçalho de outro nome, aborta sem tocar em nada.
+ * @param {Sheet} dbSheet  aba Relatorio_DB
+ * @param {Array} fonteData linhas cruas de PEDIDOS (todas, inclusive as já correspondidas)
+ * @returns {number} quantidade de células de INFO_Y atualizadas
+ */
+function _propagarInfoYParaDB_(dbSheet, fonteData) {
+  // Garante espaço físico até a coluna Z
+  if (dbSheet.getMaxColumns() < DB_COLY_COL + 1) {
+    dbSheet.insertColumnsAfter(dbSheet.getMaxColumns(), DB_COLY_COL + 1 - dbSheet.getMaxColumns());
+  }
+
+  // Garante o cabeçalho; nunca sobrescreve uma coluna com nome diferente
+  const headerZ = String(dbSheet.getRange(1, DB_COLY_COL + 1).getValue() || '').trim();
+  if (headerZ === '') {
+    dbSheet.getRange(1, DB_COLY_COL + 1).setValue('INFO_Y')
+      .setFontWeight('bold').setBackground('#f0f2f5');
+  } else if (headerZ !== 'INFO_Y') {
+    Logger.log(`   ⚠️ Coluna Z do DB tem cabeçalho inesperado ("${headerZ}") — propagação de INFO_Y abortada`);
+    return 0;
+  }
+
+  // ID → INFO_Y, a partir de TODAS as linhas de PEDIDOS (fonteData não é consumido pela sync)
+  const idToInfoY = new Map();
+  (fonteData || []).forEach(row => {
+    const id = String(row[ID_COL] || '').trim();
+    if (!id) return;
+    const v = row[PEDIDOS_COLY_COL];
+    idToInfoY.set(id, (v === null || v === undefined) ? '' : String(v));
+  });
+  if (idToInfoY.size === 0) return 0;
+
+  const lastRow = dbSheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const numRows = lastRow - 1;
+  const dados = dbSheet.getRange(2, 1, numRows, DB_COLY_COL + 1).getValues();
+  const colZ  = dados.map(r => [r[DB_COLY_COL]]);
+
+  let atualizadas = 0;
+  dados.forEach((row, i) => {
+    const id = String(row[0] || '').trim();
+    if (!id || !idToInfoY.has(id)) return; // item fora da fonte: preserva valor atual
+    const novo  = idToInfoY.get(id);
+    const atual = (colZ[i][0] === null || colZ[i][0] === undefined) ? '' : String(colZ[i][0]);
+    if (atual !== novo) {
+      colZ[i][0] = novo;
+      atualizadas++;
+    }
+  });
+
+  if (atualizadas > 0) {
+    const destino = dbSheet.getRange(2, DB_COLY_COL + 1, numRows, 1);
+    destino.setNumberFormat('@'); // texto puro — preserva códigos/zeros à esquerda
+    destino.setValues(colZ);
+  }
+  return atualizadas;
 }
 
 // ====== ALERTAS DE FATURAMENTO ======
@@ -3802,7 +3879,8 @@ const RELATORIO_DB_HEADERS = [
   'MARCAR_FATURAR_USUARIO', // V - usuário que marcou o item para faturamento
   'LOTE_EMISSAO',           // W - lote de emissão do relatório de faturamento (FAT-001, FAT-002…)
   'PERFIL_EMISSAO',         // X - perfil de baixa (BAIXA1…BAIXA5)
-  'SEQUENCIA'               // Y - sequência do item dentro da OC conforme aba "original" (fixa)
+  'SEQUENCIA',              // Y - sequência do item dentro da OC conforme aba "original" (fixa)
+  'INFO_Y'                  // Z - campo da coluna Y da fonte (informação adicional da OC, exibida junto da marca)
 ];
 
 /**
@@ -3939,6 +4017,7 @@ function _rowToItem_(row, displayRow, colMap, rowIndex) {
     MARCAR_FATURAR: getDisp('MARCAR_FATURAR', ''),
     MARCAR_FATURAR_USUARIO: getDisp('MARCAR_FATURAR_USUARIO', ''),
     INFO_X: getDisp('INFO_X', ''),
+    INFO_Y: getDisp('INFO_Y', ''),
     LOTE:         getDisp('LOTE',         ''),
     LOTE_EMISSAO:    getDisp('LOTE_EMISSAO',    ''),
     PERFIL_EMISSAO:  getDisp('PERFIL_EMISSAO',  ''),
@@ -3963,6 +4042,7 @@ function _organizeByOC_(items) {
         ordCompra: oc,      // alias para compatibilidade com o front
         cliente: item.CLIENTE,
         infoX: item.INFO_X || '',
+        infoY: item.INFO_Y || '',
         posicaoMin: item.posicaoFonte, // menor posição em DADOS_IMPORTADOS para ordenar os cards
         items: []
       };
@@ -3974,6 +4054,10 @@ function _organizeByOC_(items) {
     // captura o primeiro valor não-vazio de INFO_X entre os itens da OC
     if (!byOC[oc].infoX && item.INFO_X) {
       byOC[oc].infoX = item.INFO_X;
+    }
+    // captura o primeiro valor não-vazio de INFO_Y entre os itens da OC
+    if (!byOC[oc].infoY && item.INFO_Y) {
+      byOC[oc].infoY = item.INFO_Y;
     }
     byOC[oc].items.push(item);
   });
@@ -4530,9 +4614,9 @@ function obterItensMarcadosParaFaturar(perfil) {
       return { success: true, items: [] };
     }
 
-    // Força leitura de pelo menos 25 colunas (A-Y) para incluir PERFIL_EMISSAO e SEQUENCIA
-    const lastCol = Math.max(sheet.getLastColumn(), 25);
-    Logger.log(`📊 Lendo ${lastCol} colunas (forçado mínimo 25)`);
+    // Força leitura de pelo menos 26 colunas (A-Z) para incluir PERFIL_EMISSAO, SEQUENCIA e INFO_Y
+    const lastCol = Math.max(sheet.getLastColumn(), 26);
+    Logger.log(`📊 Lendo ${lastCol} colunas (forçado mínimo 26)`);
 
     const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
     Logger.log(`📋 Headers lidos: ${headers.length} colunas`);
@@ -4617,6 +4701,7 @@ function obterItensMarcadosParaFaturar(perfil) {
               } catch(e) { return item.MARCAR_FATURAR_USUARIO || ''; }
             })(),
             INFO_X:          item.INFO_X          || '',
+            INFO_Y:          item.INFO_Y          || '',
             LOTE:            item.LOTE            || '',
             PERFIL_EMISSAO:  item.PERFIL_EMISSAO  || '',
             SEQUENCIA:       item.SEQUENCIA       || '',

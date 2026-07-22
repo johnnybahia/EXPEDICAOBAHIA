@@ -1896,6 +1896,7 @@
                       ordCompra:  oc.ordCompraId,
                       cliente:    oc.cliente,
                       infoX:      oc.infoX      || '',
+                      infoY:      oc.infoY      || '',
                       posicaoMin: oc.posicaoMin  ?? 999999
                     }));
 
@@ -2247,10 +2248,12 @@ ALL_OCS_ITEMS = itemsObj;
         console.log(`📊 OC ${ocInfo.ordCompra}: Prazo mínimo = ${prazoMin}, Status = ${statusPrazo}, Metros = ${totaisCard.metros}, Pares = ${totaisCard.pares}`);
 
         const dateGroupLabel = ocInfo.dateGroup ? ` <span style="font-size:0.8em;font-weight:400;color:#64748b;">· 📅 Entrega: ${ocInfo.dateGroup}</span>` : '';
+        // Marca (coluna X) + informação da coluna Y, coladas e sem rótulo
+        const _marcaCard = [ocInfo.infoX, ocInfo.infoY].map(v => String(v || '').trim()).filter(Boolean).join(' · ');
         let headerHtml = `
             <div class="card-header">
                 ${statusPrazo ? `<span class="prazo-badge ${statusPrazo}">${textoPrazo}</span>` : ''}
-                <h3>OC: ${ocInfo.ordCompra} | ${ocInfo.cliente || 'Sem cliente'}${ocInfo.infoX ? ` <span class="oc-info-x">| ${ocInfo.infoX}</span>` : ''}${dateGroupLabel}</h3>`;
+                <h3>OC: ${ocInfo.ordCompra} | ${ocInfo.cliente || 'Sem cliente'}${_marcaCard ? ` <span class="oc-info-x">| ${_marcaCard}</span>` : ''}${dateGroupLabel}</h3>`;
         
         // NOVO: Adiciona totalizador do card
         if (totaisCard.metros > 0 || totaisCard.pares > 0) {
@@ -4548,8 +4551,11 @@ ALL_OCS_ITEMS = itemsObj;
             if (temInativos)  avisos.push('⚠️ Contém itens Inativos');
 
             const marcas = [...new Set(itens.map(i => i.INFO_X || '').filter(Boolean))].join(', ');
-            const marcaBadgeHtml = marcas
-                ? `<span class="marca-badge">${marcas.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
+            // Informação da coluna Y (alinhada à OC), colada na marca sem rótulo
+            const infoYs = [...new Set(itens.map(i => i.INFO_Y || '').filter(Boolean))].join(', ');
+            const marcaComY = [marcas, infoYs].filter(Boolean).join(' · ');
+            const marcaBadgeHtml = marcaComY
+                ? `<span class="marca-badge">${marcaComY.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
                 : '';
 
             // Mostra data de entrega do grupo no cabeçalho
@@ -4806,11 +4812,14 @@ ALL_OCS_ITEMS = itemsObj;
 
             const marcaCliente = _chaveAgrupamentoFatur(itens[0] || {});
             const marcaLabel = marcaCliente && marcaCliente !== '(Sem Referência)' ? marcaCliente : '';
+            // Marca (coluna X) + informação da coluna Y, coladas e sem rótulo
+            const _infoYProd = itens[0] && itens[0].INFO_Y ? String(itens[0].INFO_Y).trim() : '';
+            const marcaLabelFull = [marcaLabel, _infoYProd].filter(Boolean).join(' · ');
 
             html += `
                 <div class="oc-section">
                     <div class="oc-header ${temFaturados ? 'faturado-pending' : ''}">
-                        <div class="oc-title">OC: ${ocNum} - ${nomeCliente}${marcaLabel ? ` <span class="oc-marca">📋 ${marcaLabel}</span>` : ''}</div>
+                        <div class="oc-title">OC: ${ocNum} - ${nomeCliente}${marcaLabelFull ? ` <span class="oc-marca">📋 ${marcaLabelFull}</span>` : ''}</div>
                         ${avisos.length > 0 ? `<div class="oc-avisos">${avisos.join(' | ')}</div>` : ''}
                     </div>
                     <table>
@@ -5430,6 +5439,7 @@ ALL_OCS_ITEMS = itemsObj;
                 gruposPorInfoX[infoX][oc] = {
                     cliente: item.CLIENTE || 'SEM CLIENTE',
                     marca: (item.INFO_X || '').trim(),
+                    infoY: (item.INFO_Y || '').trim(),
                     itens: []
                 };
             }
@@ -5543,10 +5553,10 @@ ALL_OCS_ITEMS = itemsObj;
                 const itens  = ocData.itens.slice().sort((a, b) =>
                     _tsDataEntrega(a['DT. ENTREGA']) - _tsDataEntrega(b['DT. ENTREGA']) || 0
                 );
-                // Marca exibida ao lado do nome do cliente (quando não for redundante)
-                const marcaOc = ocData.marca && ocData.marca !== ocData.cliente
-                    ? ` - ${ocData.marca}`
-                    : '';
+                // Marca (coluna X) + informação da coluna Y, coladas ao lado do cliente e sem rótulo
+                const _marcaBaseFat = ocData.marca && ocData.marca !== ocData.cliente ? ocData.marca : '';
+                const _marcaFullFat = [_marcaBaseFat, ocData.infoY].filter(Boolean).join(' · ');
+                const marcaOc = _marcaFullFat ? ` - ${_marcaFullFat}` : '';
 
                 html += `
                 <div class="oc-section">
