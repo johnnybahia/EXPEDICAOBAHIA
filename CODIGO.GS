@@ -913,6 +913,7 @@ function onOpen() {
     .addSeparator()
     .addItem('🔎 Diagnosticar itens duplicados em 2 OCs', 'diagnosticarItensDuplicadosOC')
     .addItem('🧹 Arquivar duplicatas órfãs (Faturado na OC errada)', 'arquivarDuplicatasOrfas')
+    .addItem('🧹 Remover duplicatas órfãs do Relatorio_DB (Ativo sem origem)', 'limparDuplicatasOrfasDB')
     .addSeparator()
     .addItem('⚠️ RESET COMPLETO (apaga DB + regenera IDs)', 'resetarEReprocessar')
     .addSeparator()
@@ -1374,6 +1375,17 @@ function sincronizarPedidosComFonte(forcarExecucao) {
     let pedidosData = [];
     let pedidosMap = new Map(); // impressao_digital → {id, timestamp, row, linhaOriginal}
 
+    // DILLY: mapa secundário de fingerprints SEM o campo OS para recuperar IDs existentes.
+    // Problema: para itens Dilly o OS é substituído pelo Lote (aba LOTE DILLY) em PEDIDOS,
+    // fazendo o fingerprint de PEDIDOS (com Lote) não bater com o de DADOS_IMPORTADOS (OS original).
+    // Solução: indexar por fingerprint sem OS permite reutilizar o mesmo ID/UUID a cada sync,
+    // tornando os IDs estáveis e preservando QTD.ABERTA após baixas no Relatorio_DB.
+    // IMPORTANTE: os dois mapas compartilham os MESMOS wrapper objects (mesma flag "usado") —
+    // uma linha de PEDIDOS reivindicada por um caminho fica indisponível para o outro. Sem isso,
+    // duas linhas diferentes de DADOS_IMPORTADOS podiam reivindicar a MESMA linha de PEDIDOS
+    // por tiers distintos na mesma rodada, cada uma enxergando sua própria flag.
+    const pedidosDillyMap = new Map();
+
     // Sequências (oc|seq) já atribuídas — em PEDIDOS (col V) ou no Relatorio_DB (col Y).
     // Slots usados nunca são reatribuídos a outro item (sequência é fixa para sempre).
     const seqUsadas = new Set();
@@ -1401,14 +1413,25 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         if (!pedidosMap.has(impressao)) {
           pedidosMap.set(impressao, []);
         }
-        pedidosMap.get(impressao).push({
+        const wrapper = {
           id: id,
           timestamp: timestamp,
           row: row,
           codigoFixo: String(row[PEDIDOS_CODIGO_FIXO_COL] || '').trim(),
           linhaOriginal: idx + FONTE_DATA_START_ROW,
           usado: false
-        });
+        };
+        pedidosMap.get(impressao).push(wrapper);
+
+        // DILLY: indexa o MESMO wrapper também pela fingerprint sem OS (flag "usado" compartilhada)
+        const _wCliente_ = String(row[CLIENTE_COL] || '').trim();
+        if (_wCliente_.toUpperCase().includes('DILLY') && String(id || '').trim()) {
+          const _wTam_    = String(row[TAM_COL] || '').trim();
+          const _wMarfim_ = _normalizarMarfimDilly_(String(row[MARFIM_COL] || '').trim(), _wTam_, _wCliente_);
+          const _wFp_ = `${_wCliente_}|${String(row[PEDIDO_COL] || '').trim()}|${_wMarfim_}|${_wTam_}|${String(row[OC_COL] || '').trim()}|${_normalizarData_(row[DTREC_COL])}`;
+          if (!pedidosDillyMap.has(_wFp_)) pedidosDillyMap.set(_wFp_, []);
+          pedidosDillyMap.get(_wFp_).push(wrapper);
+        }
 
         // Sequência já gravada em PEDIDOS (col V) conta como usada na sua OC
         const seqV = row[PEDIDOS_SEQ_ORIGINAL_COL];
@@ -1419,34 +1442,10 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       });
 
       Logger.log(`🔑 Mapeou ${pedidosMap.size} impressões digitais únicas`);
+      if (pedidosDillyMap.size > 0) Logger.log(`🔷 DILLY: ${pedidosDillyMap.size} fingerprint(s) sem OS indexadas de PEDIDOS (wrappers compartilhados)`);
     } else {
       Logger.log(`📋 PEDIDOS está vazio (primeira sincronização)`);
     }
-
-    // DILLY: mapa secundário de fingerprints SEM o campo OS para recuperar IDs existentes.
-    // Problema: para itens Dilly o OS é substituído pelo Lote (aba LOTE DILLY) em PEDIDOS,
-    // fazendo o fingerprint de PEDIDOS (com Lote) não bater com o de DADOS_IMPORTADOS (OS original).
-    // Solução: indexar por fingerprint sem OS permite reutilizar o mesmo ID/UUID a cada sync,
-    // tornando os IDs estáveis e preservando QTD.ABERTA após baixas no Relatorio_DB.
-    const pedidosDillyMap = new Map();
-    pedidosData.forEach(row => {
-      const _pdCliente_ = String(row[CLIENTE_COL] || '').trim();
-      if (!_pdCliente_.toUpperCase().includes('DILLY')) return;
-      const _pdId_ = String(row[ID_COL] || '').trim();
-      if (!_pdId_) return;
-      const _pdTam_    = String(row[TAM_COL]   || '').trim();
-      const _pdMarfim_ = _normalizarMarfimDilly_(String(row[MARFIM_COL] || '').trim(), _pdTam_, _pdCliente_);
-      const _pdFp_ = `${_pdCliente_}|${String(row[PEDIDO_COL] || '').trim()}|${_pdMarfim_}|${_pdTam_}|${String(row[OC_COL] || '').trim()}|${_normalizarData_(row[DTREC_COL])}`;
-      if (!pedidosDillyMap.has(_pdFp_)) pedidosDillyMap.set(_pdFp_, []);
-      pedidosDillyMap.get(_pdFp_).push({
-        id: _pdId_,
-        timestamp: row[TIMESTAMP_COL] || null,
-        row: row,
-        codigoFixo: String(row[PEDIDOS_CODIGO_FIXO_COL] || '').trim(),
-        usado: false
-      });
-    });
-    if (pedidosDillyMap.size > 0) Logger.log(`🔷 DILLY: ${pedidosDillyMap.size} fingerprint(s) sem OS indexadas de PEDIDOS`);
 
     // PASSO 3: Processar cada linha da fonte
     const novasPedidosData = [];
@@ -1459,6 +1458,13 @@ function sincronizarPedidosComFonte(forcarExecucao) {
     // Isso evita que itens ganhem novos IDs após o usuário apagar PEDIDOS e o IMPORTRANGE
     // repopular só as colunas B-O (sem a coluna A que é gerenciada por script).
     const idsUsados = new Set();
+    // Set adicional: somente IDs já atribuídos NESTA execução (vazio no início de cada rodada).
+    // Existe porque idsUsados é pré-carregado com TODOS os IDs do Relatorio_DB — então
+    // idsUsados.has(idFinal) é esperado ser TRUE para praticamente todo ID reutilizado
+    // legitimamente, e não serve para detectar colisão entre duas linhas da fonte que,
+    // na MESMA rodada, resolveram (via pedidosMap OU pedidosDillyMap OU dbFingerprintMap)
+    // para o mesmo idFinal.
+    const idsAssignadosNestaRodada = new Set();
     const dbFingerprintMap = new Map(); // fingerprint → [id, ...] (array FIFO — suporta itens 100% idênticos)
     const dbCodigoFixoMap  = new Map(); // id → codigoFixo (reutilizar UUID já gravado no DB)
     const dbSheetRef = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
@@ -1593,13 +1599,11 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       let codigoFixo = ''; // UUID fixo por item — gerado uma vez, preservado para sempre
       let matchEscolhido = null; // declarado no escopo externo para uso na resolução de posicaoFonte
 
+      // Seleciona um slot ainda NÃO usado do fingerprint padrão (com OS), se existir.
+      // Se há múltiplos candidatos com a mesma fingerprint (mesmo produto, QTDs diferentes),
+      // usa QTD como critério de desempate para garantir matching estável mesmo quando o
+      // IMPORTRANGE reordena as linhas — evita troca de IDs entre itens duplicados.
       if (matches && matches.length > 0) {
-        // TEM MATCH(ES) em PEDIDOS - Reusar ID existente
-
-        // Encontra match não usado.
-        // Se há múltiplos candidatos com a mesma fingerprint (mesmo produto, QTDs diferentes),
-        // usa QTD como critério de desempate para garantir matching estável mesmo quando o
-        // IMPORTRANGE reordena as linhas — evita troca de IDs entre itens duplicados.
         const unusedMatches = matches.filter(m => !m.usado);
         if (unusedMatches.length > 1) {
           const fonteQtd = Number(fonteRow[9] || 0); // QTD em DADOS_IMPORTADOS (índice 9)
@@ -1612,47 +1616,53 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         } else {
           matchEscolhido = unusedMatches[0] || null;
         }
+      }
 
-        if (!matchEscolhido) {
-          // Todos os matches já foram usados (mais itens na fonte que em PEDIDOS)
-          isNovo = true;
-        } else {
-          matchEscolhido.usado = true;
-          codigoFixo = matchEscolhido.codigoFixo || ''; // reutiliza UUID já existente em PEDIDOS
+      if (matchEscolhido) {
+        // TEM MATCH em PEDIDOS - Reusar ID existente
+        matchEscolhido.usado = true;
+        codigoFixo = matchEscolhido.codigoFixo || ''; // reutiliza UUID já existente em PEDIDOS
 
-          // Se a coluna A do PEDIDOS estava vazia (usuário apagou o PEDIDOS e o IMPORTRANGE
-          // trouxe de volta só os dados B-O), tenta recuperar o ID do Relatorio_DB antes de
-          // gerar um novo — evita que itens existentes ganhem novos IDs.
-          const idExistente = String(matchEscolhido.id || '').trim();
-          if (!idExistente) {
-            const _fpList1_ = dbFingerprintMap.get(impressao);
-            const idRecuperado = (_fpList1_ && _fpList1_.length > 0) ? _fpList1_.shift() : null;
-            if (idRecuperado) {
-              Logger.log(`   🔄 ID recuperado do DB para item sem ID em PEDIDOS: "${idRecuperado}"`);
-              idFinal = idRecuperado;
-              timestampFinal = matchEscolhido.timestamp || new Date();
-            } else {
-              isNovo = true; // nunca esteve no DB: gerar novo ID normalmente
-            }
+        // Se a coluna A do PEDIDOS estava vazia (usuário apagou o PEDIDOS e o IMPORTRANGE
+        // trouxe de volta só os dados B-O), tenta recuperar o ID do Relatorio_DB antes de
+        // gerar um novo — evita que itens existentes ganhem novos IDs.
+        const idExistente = String(matchEscolhido.id || '').trim();
+        if (!idExistente) {
+          const _fpList1_ = dbFingerprintMap.get(impressao);
+          const idRecuperado = (_fpList1_ && _fpList1_.length > 0) ? _fpList1_.shift() : null;
+          if (idRecuperado) {
+            Logger.log(`   🔄 ID recuperado do DB para item sem ID em PEDIDOS: "${idRecuperado}"`);
+            idFinal = idRecuperado;
+            timestampFinal = matchEscolhido.timestamp || new Date();
           } else {
-            idFinal = idExistente;
-            timestampFinal = matchEscolhido.timestamp;
+            isNovo = true; // nunca esteve no DB: gerar novo ID normalmente
           }
+        } else {
+          idFinal = idExistente;
+          timestampFinal = matchEscolhido.timestamp;
+        }
 
-          if (!isNovo) {
-            itensAtualizados++;
-            // Detecta mudança real nos dados
-            for (const [fi, pi] of FONTE_PARA_PEDIDOS_COLS) {
-              const fv = fonteRow[fi];
-              const pv = matchEscolhido.row[pi];
-              const fStr = fv instanceof Date ? _toISOStringSafe_(fv) : String(fv || '');
-              const pStr = pv instanceof Date ? _toISOStringSafe_(pv) : String(pv || '');
-              if (fStr !== pStr) { itensComMudancaReal++; break; }
-            }
+        if (!isNovo) {
+          itensAtualizados++;
+          // Detecta mudança real nos dados
+          for (const [fi, pi] of FONTE_PARA_PEDIDOS_COLS) {
+            const fv = fonteRow[fi];
+            const pv = matchEscolhido.row[pi];
+            const fStr = fv instanceof Date ? _toISOStringSafe_(fv) : String(fv || '');
+            const pStr = pv instanceof Date ? _toISOStringSafe_(pv) : String(pv || '');
+            if (fStr !== pStr) { itensComMudancaReal++; break; }
           }
         }
       } else {
-        // NÃO TEM MATCH em PEDIDOS pelo fingerprint padrão (inclui OS).
+        // SEM SLOT DISPONÍVEL pelo fingerprint padrão (com OS) — ou não existe nenhum match,
+        // ou todos os matches já foram consumidos por outras linhas da fonte nesta rodada.
+        //
+        // O caso "todos os matches já usados" ia DIRETO para isNovo=true, sem tentar o
+        // fallback Dilly sem OS nem a recuperação pelo DB. Para grupos Dilly com OS vazio na
+        // fonte (a fila LOTE DILLY esgotada deixa uma linha de PEDIDOS com OS vazio — a única
+        // cujo fingerprint padrão bate com a fonte), todas as linhas-irmãs do grupo disputavam
+        // esse único slot; as perdedoras ganhavam ID + UUID novos A CADA sync, e o
+        // Relatorio_DB acumulava uma duplicata por ciclo.
         // DILLY: tenta fingerprint sem OS — em PEDIDOS o OS foi substituído pelo Lote (≠ OS original).
         const _fonteClienteStr_ = String(fonteRow[1] || '').trim();
         let _dillyMatchResolvido_ = false;
@@ -1728,6 +1738,26 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         novosItens++;
       }
 
+      // GUARDA ANTI-DUPLICATA: garante que nenhuma outra linha da fonte, NESTA MESMA rodada,
+      // já tenha resolvido para este idFinal — independente de qual caminho (pedidosMap,
+      // pedidosDillyMap ou dbFingerprintMap) o originou. PEDIDOS é o ponto mais upstream do
+      // pipeline: todo o resto (Relatorio_DB, Baixas_Historico) referencia itens por ID_UNICO
+      // originado aqui, então garantir unicidade neste ponto é a defesa de maior alcance.
+      if (idsAssignadosNestaRodada.has(idFinal)) {
+        const idOriginal = idFinal;
+        let dupSufixo = 1;
+        while (idsUsados.has(idFinal) || idsAssignadosNestaRodada.has(idFinal)) {
+          idFinal = idOriginal + "-DUP" + dupSufixo;
+          dupSufixo++;
+        }
+        Logger.log(`   ⚠️ COLISÃO DE ID NA MESMA RODADA: "${idOriginal}" já atribuído a outra linha da fonte. Renomeado para "${idFinal}".`);
+        timestampFinal = new Date();
+        // Força geração de um UUID novo — o UUID antigo (se houver) pertence à linha que já
+        // reivindicou idOriginal e não deve ser herdado pela linha renomeada.
+        codigoFixo = '';
+      }
+
+      idsAssignadosNestaRodada.add(idFinal);
       idsUsados.add(idFinal);
 
       // Resolve CÓDIGO_FIXO: reutiliza o que já existe (PEDIDOS ou DB), senão gera novo UUID
@@ -2682,6 +2712,12 @@ function sincronizarDados() {
     }
 
     const dbMap = new Map();
+    // Linhas extras quando dois ou mais registros do Relatorio_DB compartilham o mesmo ID_UNICO
+    // (ex: resíduo de sync antigo). dbMap.set() por si só sobrescreveria silenciosamente as
+    // ocorrências mais antigas, tornando-as "fantasmas" invisíveis ao loop principal (nunca
+    // resolvidas para Faturado nem alertadas) — mas ainda visíveis no HTML, que lê a planilha
+    // linha a linha. Aqui guardamos cada ocorrência substituída para que seja processada também.
+    const dbDuplicatasExtras = [];
     const statusCount = { Ativo: 0, Inativo: 0, Faturado: 0, Excluido: 0 };
 
     dbData.forEach((row, idx) => {
@@ -2692,6 +2728,13 @@ function sincronizarDados() {
       const id = row[ID_COL];  // Coluna A (índice 0)
       if (id && String(id).trim()) {
         const idStr = String(id).trim();
+        if (dbMap.has(idStr)) {
+          // ID_UNICO duplicado: a ocorrência anterior (linha mais antiga) seria perdida.
+          // Guarda para reprocessamento em vez de descartar.
+          const anterior = dbMap.get(idStr);
+          dbDuplicatasExtras.push(anterior);
+          Logger.log(`   ⚠️ ID_UNICO duplicado: "${idStr}" — linha ${anterior.linha} será reprocessada separadamente (substituída pela linha ${linhaReal} no dbMap)`);
+        }
         dbMap.set(idStr, { row: row, linha: linhaReal });
         const st = row[STATUS_COL];  // Coluna O (índice 14)
         if (st === 'Ativo') statusCount.Ativo++;
@@ -2704,6 +2747,9 @@ function sincronizarDados() {
     const totalDB = dbMap.size;
     Logger.log(`   ${totalDB} itens`);
     Logger.log(`   Status: ${statusCount.Ativo} Ativo, ${statusCount.Inativo} Inativo, ${statusCount.Faturado} Faturado, ${statusCount.Excluido} Excluido`);
+    if (dbDuplicatasExtras.length > 0) {
+      Logger.log(`   ⚠️ ${dbDuplicatasExtras.length} linha(s) com ID_UNICO duplicado serão reprocessadas nesta sincronização`);
+    }
 
     // 2.5) CRIAR MAPS DE IMPRESSÕES DIGITAIS
     Logger.log("\n🔍 2.5. CRIANDO IMPRESSÕES DIGITAIS");
@@ -2856,7 +2902,38 @@ function sincronizarDados() {
     }
     Logger.log(`   ${idsComAlertaAtivo.size} IDs com alerta de faturamento ativo`);
 
-    for (let [id, dbItem] of dbMap.entries()) {
+    // Processa primeiro as entradas "vencedoras" do dbMap (uma por ID_UNICO) e só depois as
+    // ocorrências duplicadas capturadas em dbDuplicatasExtras. Essa ordem é essencial: ao
+    // processar a vencedora primeiro, qualquer match bem-sucedido consome (fonteMap.delete) o
+    // slot correspondente em PEDIDOS, garantindo que a duplicata (mesmo ID, linha antiga) não
+    // encontre o mesmo item novamente — ela cai corretamente em "não encontrado" e é resolvida
+    // (Faturado ou alerta) pela mesma lógica já existente, em vez de ficar invisível para sempre.
+    const dbEntriesParaProcessar = [
+      ...dbMap.entries(),
+      ...dbDuplicatasExtras.map(dbItem => [String(dbItem.row[ID_COL]).trim(), dbItem])
+    ];
+
+    // A busca era feita em um único loop, por item, na ordem ID → UUID → fingerprint. Quando
+    // dois itens do DB são "gêmeos" de fingerprint (mesmo CLIENTE/PEDIDO/MARFIM/TAM/OC/OS/DATA
+    // — comum em Dilly, onde o mesmo Lote pode valer para várias linhas idênticas) e só um deles
+    // ainda tem correspondência real em PEDIDOS, a ordem de iteração decidia o resultado: se o
+    // item SEM UUID válido fosse processado antes do item COM UUID válido, a TERCEIRA TENTATIVA
+    // (fingerprint) "roubava" a vaga em PEDIDOS antes do dono legítimo confirmar pela SEGUNDA
+    // TENTATIVA (UUID). Como a busca por UUID consulta fonteCodigoFixoMap diretamente — sem
+    // checar se a vaga em fonteMap/fonteImpressoes já foi consumida — o item legítimo TAMBÉM
+    // encontrava o mesmo "novoId" de forma independente. Resultado: dois itens do DB gravados
+    // com o MESMO ID nesta mesma sincronização — duplicata recém-fabricada.
+    //
+    // Correção: duas passadas. A Passada 1 resolve ID e UUID para TODOS os itens primeiro,
+    // esgotando todas as vagas legítimas por UUID antes de qualquer fingerprint rodar. A
+    // Passada 2 resolve fingerprint e "não encontrado" só para quem sobrou.
+    // CUIDADO: não fundir as duas passadas de volta num loop único — a corrida volta. Qualquer
+    // nova tentativa de match adicionada à Passada 1 deve resolver para TODOS os itens antes de
+    // qualquer lógica de Passada 2 ler fonteMap/fonteImpressoes.
+    const pendentes = [];
+
+    // ============ PASSADA 1: PRIMEIRA TENTATIVA (ID) + SEGUNDA TENTATIVA (UUID) ============
+    for (let [id, dbItem] of dbEntriesParaProcessar) {
       const statusAtual = dbItem.row[STATUS_COL];  // Coluna O (índice 14)
 
       // Se item está Excluido mas voltou ao PEDIDOS: reativa e remove do fonteMap
@@ -3045,177 +3122,188 @@ function sincronizarDados() {
           consumedFingerprints.add(_criarImpressaoDigital_(dbItem.row, true));
 
         } else {
-          // TERCEIRA TENTATIVA: Buscar por IMPRESSÃO DIGITAL (fallback para itens sem UUID ou UUID ausente)
-          const impressaoDB = _criarImpressaoDigital_(dbItem.row, true); // row do Relatorio_DB
-          // FIX Bug 2: era fonteImpressoes.get() (sobrescrevia duplicatas); agora encontra primeiro slot livre.
-          const fonteItens = fonteImpressoes.get(impressaoDB);
-          let fonteItem = fonteItens ? fonteItens.find(i => !i.usado) : null;
-          let migrouDeOc = false;
+          // Adiada para a Passada 2 (fingerprint + não-encontrado) — ver comentário acima do loop.
+          pendentes.push([id, dbItem]);
+        }
+      }
+    }
 
-          // QUARTA TENTATIVA: o item pode ter sido MOVIDO para outra ORD. COMPRA.
-          // ID, CÓDIGO_FIXO e impressão digital padrão embutem a OC, então todos falham
-          // nesse caso e o item seria contado como "saiu do PEDIDOS" (marcado Faturado)
-          // enquanto a linha da nova OC entrava como item novo — duplicando o item no HTML.
-          // Só aceita quando há exatamente UM candidato livre: com mais de um não há como
-          // saber qual linha corresponde a qual, e o comportamento antigo é mantido.
-          if (!fonteItem) {
-            const impressaoSemOcDB = _criarImpressaoDigitalSemOC_(dbItem.row, true);
-            const livresSemOc = impressaoSemOcDB
-              ? (fonteImpressoesSemOC.get(impressaoSemOcDB) || []).filter(f => !f.usado)
-              : [];
-            if (livresSemOc.length === 1) {
-              fonteItem = livresSemOc[0];
-              migrouDeOc = true;
-            } else if (livresSemOc.length > 1) {
-              Logger.log(`   ⚠️ Troca de OC ambígua (${livresSemOc.length} candidatos em PEDIDOS) para ID="${id}" — não aplicada`);
-            }
+    // ============ PASSADA 2: TERCEIRA TENTATIVA (fingerprint) + NÃO ENCONTROU ============
+    // Só chegam aqui itens que não casaram por ID nem por UUID na Passada 1 — ou seja, toda
+    // reivindicação legítima por UUID já consumiu sua vaga em fonteMap/fonteImpressoes antes
+    // de qualquer tentativa por fingerprint rodar, eliminando a corrida que fabricava duplicatas.
+    for (let [id, dbItem] of pendentes) {
+      const statusAtual = dbItem.row[STATUS_COL];
+
+      // TERCEIRA TENTATIVA: Buscar por IMPRESSÃO DIGITAL (fallback para itens sem UUID ou UUID ausente)
+      const impressaoDB = _criarImpressaoDigital_(dbItem.row, true); // row do Relatorio_DB
+      // FIX Bug 2: era fonteImpressoes.get() (sobrescrevia duplicatas); agora encontra primeiro slot livre.
+      const fonteItens = fonteImpressoes.get(impressaoDB);
+      let fonteItem = fonteItens ? fonteItens.find(i => !i.usado) : null;
+      let migrouDeOc = false;
+
+      // QUARTA TENTATIVA: o item pode ter sido MOVIDO para outra ORD. COMPRA.
+      // ID, CÓDIGO_FIXO e impressão digital padrão embutem a OC, então todos falham
+      // nesse caso e o item seria contado como "saiu do PEDIDOS" (marcado Faturado)
+      // enquanto a linha da nova OC entrava como item novo — duplicando o item no HTML.
+      // Só aceita quando há exatamente UM candidato livre: com mais de um não há como
+      // saber qual linha corresponde a qual, e o comportamento antigo é mantido.
+      if (!fonteItem) {
+        const impressaoSemOcDB = _criarImpressaoDigitalSemOC_(dbItem.row, true);
+        const livresSemOc = impressaoSemOcDB
+          ? (fonteImpressoesSemOC.get(impressaoSemOcDB) || []).filter(f => !f.usado)
+          : [];
+        if (livresSemOc.length === 1) {
+          fonteItem = livresSemOc[0];
+          migrouDeOc = true;
+        } else if (livresSemOc.length > 1) {
+          Logger.log(`   ⚠️ Troca de OC ambígua (${livresSemOc.length} candidatos em PEDIDOS) para ID="${id}" — não aplicada`);
+        }
+      }
+
+      if (fonteItem) {
+        // ENCONTROU POR FINGERPRINT! O ID mudou devido ao IMPORTRANGE
+        fonteItem.usado = true; // consome este slot sem apagar outros com a mesma fingerprint
+        const novoId = fonteItem.id;
+        if (migrouDeOc) {
+          Logger.log(`   🔀 Item mudou de ORD. COMPRA: "${dbItem.row[DB_OC_COL]}" → "${fonteItem.row[OC_COL]}" — linha ${dbItem.linha} atualizada (ID "${id}" → "${novoId}")`);
+        } else {
+          Logger.log(`   🔄 ID atualizado por fingerprint: "${id}" → "${novoId}" (Linha ${dbItem.linha})`);
+        }
+
+        const fonteRow = fonteItem.row;
+        let marcarFaturarAtual = dbItem.row[MARCAR_FATURAR_COL] || "";
+
+        const pedidosQtdFp    = Number(fonteRow[QTD_COL] || 0);
+        const dbQtdFp         = Number(dbItem.row[DB_QTD_COL] || 0);
+        const temBaixasFp     = idsBaixados.has(id);
+        const baselineCicloFp = qtdBaselineCicloMap[id];
+        const resetCicloFp    = temBaixasFp && pedidosQtdFp > 0
+          && baselineCicloFp !== undefined && pedidosQtdFp !== baselineCicloFp
+          && statusAtual !== "Faturado" && statusAtual !== "Finalizado";
+        const qtdParaDBFp     = (temBaixasFp && !resetCicloFp) ? dbQtdFp : pedidosQtdFp;
+        if (resetCicloFp) {
+          marcarFaturarAtual = '';
+          _registrarCheckpointFaturamento_(id, pedidosQtdFp);
+          _removerAlertasDoItem_(id);
+          idsParaLimparUsuario.push({ id: id, linha: dbItem.linha });
+          Logger.log(`   🔁 RESET ciclo faturamento (fp): ID="${id}" baseline=${baselineCicloFp} → fonte=${pedidosQtdFp}`);
+        } else if (!temBaixasFp && pedidosQtdFp !== dbQtdFp) {
+          Logger.log(`   🔄 QTD sincronizada com fonte (fingerprint): ${dbQtdFp} → ${pedidosQtdFp} (sem baixas registradas, ID="${id}")`);
+        }
+
+        const cfFp = dbItem.row[DB_CODIGO_FIXO_COL] || fonteRow[PEDIDOS_CODIGO_FIXO_COL] || '';
+        const novaLinha = [
+          novoId,                fonteRow[CARTELA_COL], fonteRow[CLIENTE_COL],
+          fonteRow[PEDIDO_COL],  fonteRow[CODCLI_COL],  fonteRow[MARFIM_COL],
+          fonteRow[DESC_COL],    fonteRow[TAM_COL],     fonteRow[OC_COL],
+          qtdParaDBFp,           fonteRow[OS_COL],      fonteRow[DTREC_COL],
+          fonteRow[DTENT_COL],   fonteRow[PRAZO_COL],   "",                    marcarFaturarAtual,
+          dbItem.row[DATA_STATUS_COL] || '', fonteRow[PEDIDOS_POSICAO_FONTE_COL] ?? '', cfFp,  // Q: DATA_STATUS preservado, R: POSICAO_FONTE, S: CÓDIGO_FIXO
+          fonteRow[PEDIDOS_COLX_COL] || '',  // T: INFO_X
+          fonteRow[PEDIDOS_LOTE_COL] || ''   // U: LOTE
+        ];
+
+        const novoStatus = (statusAtual === "Faturado" || statusAtual === "Finalizado") ? statusAtual : "Ativo";
+        novaLinha[STATUS_COL] = novoStatus;
+
+        updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: novoId });
+        idsAtualizados.push({ de: id, para: novoId, linha: dbItem.linha });
+
+        // Remove do fonteMap para não adicionar como novo depois.
+        // Não apaga a chave do fonteImpressoes — apenas o slot foi marcado como usado,
+        // permitindo que outros DB-items com a mesma fingerprint ainda encontrem seus slots.
+        fonteMap.delete(novoId);
+        consumedFingerprints.add(impressaoDB); // libera fingerprint para novos itens idênticos legítimos
+
+      } else {
+        // NÃO ENCONTROU por ID, UUID nem fingerprint — item não está em PEDIDOS
+        const ocDB = String(dbItem.row[DB_OC_COL] || '').trim();
+        const osDB = String(dbItem.row[10]          || '').trim(); // índice 10 = CÓD. OS no DB
+        Logger.log(`   ❌ ID="${id}" não encontrado em PEDIDOS — OC="${ocDB}" OS="${osDB}", Status="${statusAtual}"`);
+
+        // PROTEÇÃO ANTI-FATURAMENTO INDEVIDO:
+        // Verifica se o par OC+OS ainda existe em DADOS_IMPORTADOS.
+        // Usar só OC era amplo demais: se uma OC tem 18 itens e 8 sumiram, os 8 ficavam
+        // bloqueados porque os outros 10 mantinham o OC presente.
+        // Com OC+OS, cada linha é identificada individualmente (OS é único por linha).
+        //   • OC+OS presente → item ainda no sistema, só ID/fingerprint mudou (rebuild/dado alterado)
+        //                      → NÃO marcar Faturado (sync vai reconsolidar na próxima rodada)
+        //   • OC+OS ausente  → item genuinamente saiu do sistema de origem → prossegue normal
+        const chaveOcOs = `${ocDB}|${osDB}`;
+
+        // PROTEÇÃO ANTI-FATURAMENTO INDEVIDO (proporcional, sem bloquear ações do usuário):
+        // Compara contagem de slots em DADOS_IMPORTADOS vs DB ativo por OC+OS.
+        //   fonte >= DB ativo → possível mismatch de ID (rebuild) → proteção ativa
+        //   fonte <  DB ativo → item em excesso → proteção inativa (prossegue)
+        //   fonte = 0         → item saiu do sistema → proteção inativa (prossegue)
+        //
+        // A proteção NÃO bloqueia:
+        //   • MARCAR_FATURAR=SIM já setado (usuário marcou explicitamente)
+        //   • QTD=0 (baixas completas — item entregue, pode faturar)
+        //   • idsBaixados (usuário fez ao menos uma baixa — item sendo trabalhado)
+        // A proteção BLOQUEIA apenas:
+        //   • QTD>0 + sem baixas + sem marcação → possível ID-mismatch, aguarda reconsolidação
+        let protecaoAtiva = false;
+        if (dadosImportadosOcs.size > 0) {
+          const slotsOrigem   = dadosImportadosOcs.get(chaveOcOs) || 0;
+          const slotsDbAtivos = dbActiveOcOsCount.get(chaveOcOs)  || 0;
+          if (slotsOrigem > 0 && slotsOrigem >= slotsDbAtivos) {
+            protecaoAtiva = true;
+            Logger.log(`   🛡️ Proteção: OC+OS "${chaveOcOs}" fonte=${slotsOrigem} ≥ DB ativo=${slotsDbAtivos}`);
+          } else if (slotsOrigem > 0) {
+            Logger.log(`   ⚠️ OC+OS "${chaveOcOs}" fonte=${slotsOrigem} < DB ativo=${slotsDbAtivos} → item em excesso no DB, prossegue`);
           }
+        }
 
-          if (fonteItem) {
-            // ENCONTROU POR FINGERPRINT! O ID mudou devido ao IMPORTRANGE
-            fonteItem.usado = true; // consome este slot sem apagar outros com a mesma fingerprint
-            const novoId = fonteItem.id;
-            if (migrouDeOc) {
-              Logger.log(`   🔀 Item mudou de ORD. COMPRA: "${dbItem.row[DB_OC_COL]}" → "${fonteItem.row[OC_COL]}" — linha ${dbItem.linha} atualizada (ID "${id}" → "${novoId}")`);
-            } else {
-              Logger.log(`   🔄 ID atualizado por fingerprint: "${id}" → "${novoId}" (Linha ${dbItem.linha})`);
-            }
+        // FIX: Se o usuário do HTML já marcou o item para faturar (MARCAR_FATURAR=SIM),
+        // o item pode ter sido fechado/removido pelo sistema de origem mas ainda não foi
+        // faturado. Manter visível e ativo para o usuário do HTML concluir o processo.
+        // SEMPRE processado, independente da proteção.
+        const marcarFaturar = String(dbItem.row[MARCAR_FATURAR_COL] || '').trim().toUpperCase();
+        const aguardandoNF = marcarFaturar === 'SIM';
+        const qtdAberta    = Number(dbItem.row[DB_QTD_COL] || 0);
+        const temBaixas    = idsBaixados.has(id); // usuário já processou pelo menos uma baixa
 
-            const fonteRow = fonteItem.row;
-            let marcarFaturarAtual = dbItem.row[MARCAR_FATURAR_COL] || "";
+        // Proteção extra: se MARCAR_FATURAR=SIM, verifica fingerprint para detectar
+        // ID mudado (item ainda existe em PEDIDOS com outro ID) — mantém Ativo nesses casos.
+        let itemAindaEmPedidosPorFingerprint = false;
+        if (aguardandoNF) {
+          const fpDB = _criarImpressaoDigital_(dbItem.row, true);
+          itemAindaEmPedidosPorFingerprint = fonteImpressoes.has(fpDB) && fonteImpressoes.get(fpDB).some(i => !i.usado);
+          if (itemAindaEmPedidosPorFingerprint) {
+            Logger.log(`   ⚠️ DUPLICATA: Item aguardando NF existe em PEDIDOS com ID diferente — mantido Ativo OC="${dbItem.row[DB_OC_COL]}" QTD=${qtdAberta} ID="${id}"`);
 
-            const pedidosQtdFp    = Number(fonteRow[QTD_COL] || 0);
-            const dbQtdFp         = Number(dbItem.row[DB_QTD_COL] || 0);
-            const temBaixasFp     = idsBaixados.has(id);
-            const baselineCicloFp = qtdBaselineCicloMap[id];
-            const resetCicloFp    = temBaixasFp && pedidosQtdFp > 0
-              && baselineCicloFp !== undefined && pedidosQtdFp !== baselineCicloFp
-              && statusAtual !== "Faturado" && statusAtual !== "Finalizado";
-            const qtdParaDBFp     = (temBaixasFp && !resetCicloFp) ? dbQtdFp : pedidosQtdFp;
-            if (resetCicloFp) {
-              marcarFaturarAtual = '';
-              _registrarCheckpointFaturamento_(id, pedidosQtdFp);
-              _removerAlertasDoItem_(id);
-              idsParaLimparUsuario.push({ id: id, linha: dbItem.linha });
-              Logger.log(`   🔁 RESET ciclo faturamento (fp): ID="${id}" baseline=${baselineCicloFp} → fonte=${pedidosQtdFp}`);
-            } else if (!temBaixasFp && pedidosQtdFp !== dbQtdFp) {
-              Logger.log(`   🔄 QTD sincronizada com fonte (fingerprint): ${dbQtdFp} → ${pedidosQtdFp} (sem baixas registradas, ID="${id}")`);
-            }
+          }
+        }
 
-            const cfFp = dbItem.row[DB_CODIGO_FIXO_COL] || fonteRow[PEDIDOS_CODIGO_FIXO_COL] || '';
-            const novaLinha = [
-              novoId,                fonteRow[CARTELA_COL], fonteRow[CLIENTE_COL],
-              fonteRow[PEDIDO_COL],  fonteRow[CODCLI_COL],  fonteRow[MARFIM_COL],
-              fonteRow[DESC_COL],    fonteRow[TAM_COL],     fonteRow[OC_COL],
-              qtdParaDBFp,           fonteRow[OS_COL],      fonteRow[DTREC_COL],
-              fonteRow[DTENT_COL],   fonteRow[PRAZO_COL],   "",                    marcarFaturarAtual,
-              dbItem.row[DATA_STATUS_COL] || '', fonteRow[PEDIDOS_POSICAO_FONTE_COL] ?? '', cfFp,  // Q: DATA_STATUS preservado, R: POSICAO_FONTE, S: CÓDIGO_FIXO
-              fonteRow[PEDIDOS_COLX_COL] || '',  // T: INFO_X
-              fonteRow[PEDIDOS_LOTE_COL] || ''   // U: LOTE
-            ];
-
-            const novoStatus = (statusAtual === "Faturado" || statusAtual === "Finalizado") ? statusAtual : "Ativo";
-            novaLinha[STATUS_COL] = novoStatus;
-
-            updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: novoId });
-            idsAtualizados.push({ de: id, para: novoId, linha: dbItem.linha });
-
-            // Remove do fonteMap para não adicionar como novo depois.
-            // Não apaga a chave do fonteImpressoes — apenas o slot foi marcado como usado,
-            // permitindo que outros DB-items com a mesma fingerprint ainda encontrem seus slots.
-            fonteMap.delete(novoId);
-            consumedFingerprints.add(impressaoDB); // libera fingerprint para novos itens idênticos legítimos
-
+        if (!itemAindaEmPedidosPorFingerprint && statusAtual !== "Faturado" && statusAtual !== "Finalizado" && statusAtual !== "Excluido") {
+          // Distingue "marcado pelo usuário" de "marcado automaticamente pelo sync":
+          // MARCAR_FATURAR_USUARIO_COL (col V) fica preenchido quando o usuário marca via UI;
+          // fica vazio quando o próprio sync define MARCAR_FATURAR="SIM" automaticamente.
+          // OBS: idsComAlertaAtivo não é mais usado porque _registrarAlertaFaturamento_ está desativada
+          // e o Set ficava sempre vazio, tornando a distinção inoperante.
+          const marcarFaturarUsuario = String(dbItem.row[MARCAR_FATURAR_USUARIO_COL] || '').trim();
+          const marcadoPeloUsuario = aguardandoNF && marcarFaturarUsuario !== '';
+          if (marcadoPeloUsuario) {
+            // MARCAR_FATURAR=SIM posto pelo USUÁRIO (col V preenchida) → saída esperada → Faturado direto
+            Logger.log(`   ✋→✅ Marcado pelo usuário (${marcarFaturarUsuario}) + saiu do PEDIDOS → Faturado direto (QTD=${qtdAberta}, ID="${id}")`);
+            itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: 0, marcadoParaNF: true });
+          } else if (aguardandoNF) {
+            // MARCAR_FATURAR=SIM posto pelo SYNC automaticamente (col V vazia) → mantém Ativo, aguarda confirmação do usuário
+            Logger.log(`   ⚠️ MARCAR_FATURAR automático (sem usuário) — mantido Ativo, aguarda confirmação (QTD=${qtdAberta}, ID="${id}")`);
+          } else if (qtdAberta === 0) {
+            // QTD=0 sem marcação: baixas zeraram o item → faturado silencioso
+            itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: 0 });
+          } else if (!protecaoAtiva || temBaixas) {
+            // QTD>0 sem marcação: saída inesperada → gera alerta
+            itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: qtdAberta });
           } else {
-            // NÃO ENCONTROU por ID, UUID nem fingerprint — item não está em PEDIDOS
-            const ocDB = String(dbItem.row[DB_OC_COL] || '').trim();
-            const osDB = String(dbItem.row[10]          || '').trim(); // índice 10 = CÓD. OS no DB
-            Logger.log(`   ❌ ID="${id}" não encontrado em PEDIDOS — OC="${ocDB}" OS="${osDB}", Status="${statusAtual}"`);
-
-            // PROTEÇÃO ANTI-FATURAMENTO INDEVIDO:
-            // Verifica se o par OC+OS ainda existe em DADOS_IMPORTADOS.
-            // Usar só OC era amplo demais: se uma OC tem 18 itens e 8 sumiram, os 8 ficavam
-            // bloqueados porque os outros 10 mantinham o OC presente.
-            // Com OC+OS, cada linha é identificada individualmente (OS é único por linha).
-            //   • OC+OS presente → item ainda no sistema, só ID/fingerprint mudou (rebuild/dado alterado)
-            //                      → NÃO marcar Faturado (sync vai reconsolidar na próxima rodada)
-            //   • OC+OS ausente  → item genuinamente saiu do sistema de origem → prossegue normal
-            const chaveOcOs = `${ocDB}|${osDB}`;
-
-            // PROTEÇÃO ANTI-FATURAMENTO INDEVIDO (proporcional, sem bloquear ações do usuário):
-            // Compara contagem de slots em DADOS_IMPORTADOS vs DB ativo por OC+OS.
-            //   fonte >= DB ativo → possível mismatch de ID (rebuild) → proteção ativa
-            //   fonte <  DB ativo → item em excesso → proteção inativa (prossegue)
-            //   fonte = 0         → item saiu do sistema → proteção inativa (prossegue)
-            //
-            // A proteção NÃO bloqueia:
-            //   • MARCAR_FATURAR=SIM já setado (usuário marcou explicitamente)
-            //   • QTD=0 (baixas completas — item entregue, pode faturar)
-            //   • idsBaixados (usuário fez ao menos uma baixa — item sendo trabalhado)
-            // A proteção BLOQUEIA apenas:
-            //   • QTD>0 + sem baixas + sem marcação → possível ID-mismatch, aguarda reconsolidação
-            let protecaoAtiva = false;
-            if (dadosImportadosOcs.size > 0) {
-              const slotsOrigem   = dadosImportadosOcs.get(chaveOcOs) || 0;
-              const slotsDbAtivos = dbActiveOcOsCount.get(chaveOcOs)  || 0;
-              if (slotsOrigem > 0 && slotsOrigem >= slotsDbAtivos) {
-                protecaoAtiva = true;
-                Logger.log(`   🛡️ Proteção: OC+OS "${chaveOcOs}" fonte=${slotsOrigem} ≥ DB ativo=${slotsDbAtivos}`);
-              } else if (slotsOrigem > 0) {
-                Logger.log(`   ⚠️ OC+OS "${chaveOcOs}" fonte=${slotsOrigem} < DB ativo=${slotsDbAtivos} → item em excesso no DB, prossegue`);
-              }
-            }
-
-            // FIX: Se o usuário do HTML já marcou o item para faturar (MARCAR_FATURAR=SIM),
-            // o item pode ter sido fechado/removido pelo sistema de origem mas ainda não foi
-            // faturado. Manter visível e ativo para o usuário do HTML concluir o processo.
-            // SEMPRE processado, independente da proteção.
-            const marcarFaturar = String(dbItem.row[MARCAR_FATURAR_COL] || '').trim().toUpperCase();
-            const aguardandoNF = marcarFaturar === 'SIM';
-            const qtdAberta    = Number(dbItem.row[DB_QTD_COL] || 0);
-            const temBaixas    = idsBaixados.has(id); // usuário já processou pelo menos uma baixa
-
-            // Proteção extra: se MARCAR_FATURAR=SIM, verifica fingerprint para detectar
-            // ID mudado (item ainda existe em PEDIDOS com outro ID) — mantém Ativo nesses casos.
-            let itemAindaEmPedidosPorFingerprint = false;
-            if (aguardandoNF) {
-              const fpDB = _criarImpressaoDigital_(dbItem.row, true);
-              itemAindaEmPedidosPorFingerprint = fonteImpressoes.has(fpDB) && fonteImpressoes.get(fpDB).some(i => !i.usado);
-              if (itemAindaEmPedidosPorFingerprint) {
-                Logger.log(`   ⚠️ DUPLICATA: Item aguardando NF existe em PEDIDOS com ID diferente — mantido Ativo OC="${dbItem.row[DB_OC_COL]}" QTD=${qtdAberta} ID="${id}"`);
-
-              }
-            }
-
-            if (!itemAindaEmPedidosPorFingerprint && statusAtual !== "Faturado" && statusAtual !== "Finalizado" && statusAtual !== "Excluido") {
-              // Distingue "marcado pelo usuário" de "marcado automaticamente pelo sync":
-              // MARCAR_FATURAR_USUARIO_COL (col V) fica preenchido quando o usuário marca via UI;
-              // fica vazio quando o próprio sync define MARCAR_FATURAR="SIM" automaticamente.
-              // OBS: idsComAlertaAtivo não é mais usado porque _registrarAlertaFaturamento_ está desativada
-              // e o Set ficava sempre vazio, tornando a distinção inoperante.
-              const marcarFaturarUsuario = String(dbItem.row[MARCAR_FATURAR_USUARIO_COL] || '').trim();
-              const marcadoPeloUsuario = aguardandoNF && marcarFaturarUsuario !== '';
-              if (marcadoPeloUsuario) {
-                // MARCAR_FATURAR=SIM posto pelo USUÁRIO (col V preenchida) → saída esperada → Faturado direto
-                Logger.log(`   ✋→✅ Marcado pelo usuário (${marcarFaturarUsuario}) + saiu do PEDIDOS → Faturado direto (QTD=${qtdAberta}, ID="${id}")`);
-                itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: 0, marcadoParaNF: true });
-              } else if (aguardandoNF) {
-                // MARCAR_FATURAR=SIM posto pelo SYNC automaticamente (col V vazia) → mantém Ativo, aguarda confirmação do usuário
-                Logger.log(`   ⚠️ MARCAR_FATURAR automático (sem usuário) — mantido Ativo, aguarda confirmação (QTD=${qtdAberta}, ID="${id}")`);
-              } else if (qtdAberta === 0) {
-                // QTD=0 sem marcação: baixas zeraram o item → faturado silencioso
-                itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: 0 });
-              } else if (!protecaoAtiva || temBaixas) {
-                // QTD>0 sem marcação: saída inesperada → gera alerta
-                itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: qtdAberta });
-              } else {
-                // QTD>0 + proteção ativa + sem baixas → aguarda reconsolidação de ID
-                Logger.log(`   ⏭️ Proteção ativa (QTD=${qtdAberta}, sem baixas) → aguarda reconsolidação — OC+OS="${chaveOcOs}"`);
-              }
-            } else if (!itemAindaEmPedidosPorFingerprint) {
-              Logger.log(`   ℹ️ Não alterado (status: ${statusAtual})`);
-            }
+            // QTD>0 + proteção ativa + sem baixas → aguarda reconsolidação de ID
+            Logger.log(`   ⏭️ Proteção ativa (QTD=${qtdAberta}, sem baixas) → aguarda reconsolidação — OC+OS="${chaveOcOs}"`);
           }
+        } else if (!itemAindaEmPedidosPorFingerprint) {
+          Logger.log(`   ℹ️ Não alterado (status: ${statusAtual})`);
         }
       }
     }
@@ -3815,6 +3903,179 @@ function _gravarDuplicatasDebug_(rows) {
     Logger.log('📋 Duplicatas_Debug: nenhuma duplicata nesta sincronização');
   }
   SpreadsheetApp.flush();
+}
+
+// ====== LIMPEZA DE DUPLICATAS ÓRFÃS ======
+/**
+ * Remove do Relatorio_DB as linhas duplicadas "órfãs" fabricadas pelo bug de IDs
+ * instáveis: quando a fila LOTE DILLY se esgota e a fonte traz OS vazio, todas as linhas-irmãs
+ * do grupo disputam um único slot de fingerprint e as perdedoras ganham ID + UUID novos a cada
+ * sync, acumulando uma cópia Ativo por ciclo no Relatorio_DB.
+ *
+ * Uma linha só é removida se TODOS os critérios forem verdadeiros:
+ *   1. Status = "Ativo" e sem nenhuma marcação (MARCAR_FATURAR, MARCAR_FATURAR_USUARIO
+ *      e LOTE_EMISSAO vazios);
+ *   2. ID_UNICO não existe em PEDIDOS e CODIGO_FIXO não existe em PEDIDOS (órfã);
+ *   3. ID_UNICO sem histórico em Baixas_Historico;
+ *   4. O grupo do item (fingerprint SEM OS) tem MAIS linhas ativas no DB do que linhas em
+ *      PEDIDOS, e o item ainda existe em PEDIDOS (quota > 0) — nunca toca itens que
+ *      saíram legitimamente da fonte (esses seguem o fluxo normal de faturamento).
+ *
+ * As linhas removidas são gravadas na aba "Duplicatas_Removidas" (append) para auditoria.
+ * Na sincronização seguinte, as linhas de PEDIDOS que ficaram sem correspondente no DB
+ * são re-adicionadas normalmente — com os IDs já estabilizados pela correção do matching.
+ * Roda sob LockService para não concorrer com o sync automático.
+ */
+function limparDuplicatasOrfasDB() {
+  const ui = SpreadsheetApp.getUi();
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (e) {
+    ui.alert('⏳ Sistema ocupado', 'Sincronização automática em andamento. Tente novamente em alguns instantes.', ui.ButtonSet.OK);
+    return;
+  }
+  try {
+    const ss = getSpreadsheet_();
+    const dbSheet = ss.getSheetByName(DB_SHEET_NAME);
+    const pedidosSheet = ss.getSheetByName(FONTE_SHEET_NAME);
+    if (!dbSheet || dbSheet.getLastRow() < 2 || !pedidosSheet || pedidosSheet.getLastRow() < FONTE_DATA_START_ROW) {
+      ui.alert('Nada a fazer', 'Relatorio_DB ou PEDIDOS sem dados.', ui.ButtonSet.OK);
+      return;
+    }
+
+    // Fingerprint SEM OS — mesma chave do pedidosDillyMap (o OS/Lote é o campo instável
+    // que diferenciava as duplicatas entre si; sem ele as cópias do mesmo item se agrupam).
+    const fpSemOS = (cliente, pedido, marfim, tam, oc, dtrec) => {
+      const c = String(cliente || '').trim();
+      const t = String(tam || '').trim();
+      return `${c}|${String(pedido || '').trim()}|${_normalizarMarfimDilly_(String(marfim || '').trim(), t, c)}|${t}|${String(oc || '').trim()}|${_normalizarData_(dtrec)}`;
+    };
+
+    // 1) PEDIDOS: IDs, UUIDs e quota de linhas por fingerprint sem OS
+    const pedidosData = pedidosSheet.getRange(FONTE_DATA_START_ROW, 1, pedidosSheet.getLastRow() - FONTE_DATA_START_ROW + 1, PEDIDOS_CODIGO_FIXO_COL + 1).getValues();
+    const peIds = new Set();
+    const peUuids = new Set();
+    const peQuota = new Map();
+    pedidosData.forEach(row => {
+      if (!row[CARTELA_COL] || String(row[CARTELA_COL]).trim() === '') return;
+      const pid = String(row[ID_COL] || '').trim();
+      if (pid) peIds.add(pid);
+      const puuid = String(row[PEDIDOS_CODIGO_FIXO_COL] || '').trim();
+      if (puuid) peUuids.add(puuid);
+      const fp = fpSemOS(row[CLIENTE_COL], row[PEDIDO_COL], row[MARFIM_COL], row[TAM_COL], row[OC_COL], row[DTREC_COL]);
+      peQuota.set(fp, (peQuota.get(fp) || 0) + 1);
+    });
+
+    // 2) IDs com histórico de baixas — nunca remover
+    const idsComBaixa = new Set();
+    const baixasSheet = ss.getSheetByName(BAIXAS_SHEET_NAME);
+    if (baixasSheet && baixasSheet.getLastRow() > 1) {
+      baixasSheet.getRange(2, 1, baixasSheet.getLastRow() - 1, 1).getValues()
+        .forEach(r => { if (r[0]) idsComBaixa.add(String(r[0]).trim()); });
+    }
+
+    // 3) Relatorio_DB: conta linhas ativas por fingerprint e aplica os critérios
+    const numDbRows = dbSheet.getLastRow() - 1;
+    const dbCols = Math.min(LOTE_EMISSAO_COL + 1, dbSheet.getMaxColumns());
+    const dbData = dbSheet.getRange(2, 1, numDbRows, dbCols).getValues();
+
+    const dbAtivosPorFp = new Map();
+    const fpPorLinha = new Array(dbData.length);
+    dbData.forEach((row, i) => {
+      const fp = fpSemOS(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[DB_OC_COL], row[11]); // 11 = DATA RECEB. no DB
+      fpPorLinha[i] = fp;
+      const st = String(row[STATUS_COL] || '').trim();
+      if (st !== 'Faturado' && st !== 'Finalizado' && st !== 'Excluido') {
+        dbAtivosPorFp.set(fp, (dbAtivosPorFp.get(fp) || 0) + 1);
+      }
+    });
+
+    const linhasParaRemover = []; // números de linha na planilha (1-based)
+    const auditoria = [];
+    dbData.forEach((row, i) => {
+      const id = String(row[ID_COL] || '').trim();
+      if (!id) return;
+      const fp = fpPorLinha[i];
+      const quota = peQuota.get(fp) || 0;
+      const ativos = dbAtivosPorFp.get(fp) || 0;
+      if (quota === 0 || ativos <= quota) return; // grupo sem excesso, ou item saiu da fonte
+      if (String(row[STATUS_COL] || '').trim() !== 'Ativo') return;
+      if (String(row[MARCAR_FATURAR_COL] || '').trim() !== '') return;
+      if (String(row[MARCAR_FATURAR_USUARIO_COL] || '').trim() !== '') return;
+      if (String(row[LOTE_EMISSAO_COL] || '').trim() !== '') return;
+      if (peIds.has(id)) return; // ainda referenciada por PEDIDOS
+      const uuid = String(row[DB_CODIGO_FIXO_COL] || '').trim();
+      if (uuid && peUuids.has(uuid)) return;
+      if (idsComBaixa.has(id)) return; // tem histórico de baixas
+
+      linhasParaRemover.push(i + 2);
+      auditoria.push([
+        new Date(), 'Órfã removida (limpeza de duplicatas)', id, Number(row[DB_QTD_COL] || 0),
+        row[CARTELA_COL], row[CLIENTE_COL], row[DB_PEDIDO_COL],
+        row[DB_OC_COL], row[DB_DESC_COL], row[DB_TAM_COL]
+      ]);
+    });
+
+    if (linhasParaRemover.length === 0) {
+      ui.alert('✅ Nenhuma duplicata órfã', 'Nenhuma linha do Relatorio_DB atende aos critérios de remoção.', ui.ButtonSet.OK);
+      return;
+    }
+
+    const resp = ui.alert(
+      '🧹 Remover duplicatas órfãs',
+      `Foram encontradas ${linhasParaRemover.length} linha(s) duplicada(s) órfã(s) no Relatorio_DB\n` +
+      `(Ativo, sem baixas, sem marcações e sem referência em PEDIDOS).\n\n` +
+      `Elas serão removidas e registradas na aba "Duplicatas_Removidas".\n\nContinuar?`,
+      ui.ButtonSet.YES_NO
+    );
+    if (resp !== ui.Button.YES) return;
+
+    // Auditoria (append — não é apagada pelo sync, ao contrário da Duplicatas_Debug)
+    let audSheet = ss.getSheetByName('Duplicatas_Removidas');
+    if (!audSheet) {
+      audSheet = ss.insertSheet('Duplicatas_Removidas');
+      audSheet.getRange(1, 1, 1, 10).setValues([[
+        'DATA_REMOCAO', 'MOTIVO', 'ID_REMOVIDO', 'QTD_ABERTA',
+        'CARTELA', 'CLIENTE', 'PEDIDO', 'OC', 'DESC', 'TAMANHO'
+      ]]);
+    }
+    audSheet.getRange(audSheet.getLastRow() + 1, 1, auditoria.length, 10).setValues(auditoria);
+
+    // Deleta de baixo para cima, agrupando intervalos contíguos (menos chamadas à API)
+    linhasParaRemover.sort((a, b) => b - a);
+    const blocos = [];
+    let fim = linhasParaRemover[0];
+    let inicio = fim;
+    for (let k = 1; k < linhasParaRemover.length; k++) {
+      const l = linhasParaRemover[k];
+      if (l === inicio - 1) {
+        inicio = l;
+      } else {
+        blocos.push([inicio, fim]);
+        fim = l;
+        inicio = l;
+      }
+    }
+    blocos.push([inicio, fim]);
+    blocos.forEach(([ini, fi]) => dbSheet.deleteRows(ini, fi - ini + 1));
+    SpreadsheetApp.flush();
+    limparCache();
+
+    Logger.log(`🧹 limparDuplicatasOrfasDB: ${linhasParaRemover.length} linha(s) removida(s) em ${blocos.length} bloco(s)`);
+    ui.alert(
+      '✅ Limpeza concluída',
+      `${linhasParaRemover.length} linha(s) duplicada(s) órfã(s) removida(s) do Relatorio_DB.\n` +
+      `Detalhes na aba "Duplicatas_Removidas".\n\n` +
+      `Na próxima sincronização os itens de PEDIDOS sem correspondente no DB serão re-adicionados com IDs estáveis.`,
+      ui.ButtonSet.OK
+    );
+  } catch (e) {
+    Logger.log(`❌ limparDuplicatasOrfasDB: ${e.message}\n${e.stack}`);
+    ui.alert('Erro', e.message, ui.ButtonSet.OK);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // ====== COMPACTAR DB ======
