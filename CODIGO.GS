@@ -911,6 +911,7 @@ function onOpen() {
     .addItem('🧹 Confirmar todos os alertas de faturamento (testes)', 'confirmarTodosAlertasMenu')
     .addItem('🔧 Corrigir Faturados com saldo aberto (reverter para Ativo)', 'corrigirFaturadosComSaldoAberto')
     .addSeparator()
+    .addItem('🛡️ Verificar duplicidade agora (sentinela)', 'verificarDuplicidadeAgora')
     .addItem('🔎 Diagnosticar itens duplicados em 2 OCs', 'diagnosticarItensDuplicadosOC')
     .addItem('🧹 Arquivar duplicatas órfãs (Faturado na OC errada)', 'arquivarDuplicatasOrfas')
     .addItem('🧹 Remover duplicatas órfãs do Relatorio_DB (Ativo sem origem)', 'limparDuplicatasOrfasDB')
@@ -990,7 +991,20 @@ function resetarEReprocessar() {
     Logger.log('✅ IDs antigos removidos da aba PEDIDOS.');
   }
 
-  // 3. Roda processo completo (sincroniza PEDIDOS + gera IDs + popula DB)
+  // 3. Reconstrói PEDIDOS a partir de DADOS_IMPORTADOS de forma FORÇADA.
+  // processoAutomaticoCompleto() chama sincronizarPedidosComFonte(false), que aborta pelo
+  // guard de H2 quando não houve importação nova — no reset isso deixaria a coluna A vazia
+  // e os IDs seriam preenchidos pelo caminho legado (gerarIDsUnicos), que não grava
+  // CÓDIGO_FIXO. Forçando aqui, o reset sempre parte da rota canônica.
+  Logger.log('🔄 Reconstruindo PEDIDOS a partir de DADOS_IMPORTADOS (forçado)...');
+  const resyncReset = sincronizarPedidosComFonte(true);
+  if (resyncReset && resyncReset.erro) {
+    Logger.log(`⚠️ Falha ao reconstruir PEDIDOS: ${resyncReset.erro} — reset interrompido`);
+    ui.alert('⚠️ Reset interrompido', `Não foi possível reconstruir a aba PEDIDOS:\n${resyncReset.erro}`, ui.ButtonSet.OK);
+    return;
+  }
+
+  // 4. Roda processo completo (gera IDs faltantes + popula DB)
   Logger.log('🔄 Iniciando processo completo...');
   processoAutomaticoCompleto();
 
@@ -1026,7 +1040,19 @@ function resetarEReprocessarSilencioso() {
     Logger.log('✅ IDs antigos removidos da aba PEDIDOS.');
   }
 
-  // 3. Roda processo completo (sincroniza PEDIDOS + gera IDs + popula DB)
+  // 3. Reconstrói PEDIDOS a partir de DADOS_IMPORTADOS de forma FORÇADA.
+  // processoAutomaticoCompleto() chama sincronizarPedidosComFonte(false), que aborta pelo
+  // guard de H2 quando não houve importação nova — no reset isso deixaria a coluna A vazia
+  // e os IDs seriam preenchidos pelo caminho legado (gerarIDsUnicos), que não grava
+  // CÓDIGO_FIXO. Forçando aqui, o reset sempre parte da rota canônica.
+  Logger.log('🔄 Reconstruindo PEDIDOS a partir de DADOS_IMPORTADOS (forçado)...');
+  const resyncReset = sincronizarPedidosComFonte(true);
+  if (resyncReset && resyncReset.erro) {
+    Logger.log(`⚠️ Falha ao reconstruir PEDIDOS: ${resyncReset.erro} — reset interrompido`);
+    return;
+  }
+
+  // 4. Roda processo completo (gera IDs faltantes + popula DB)
   Logger.log('🔄 Iniciando processo completo...');
   processoAutomaticoCompleto();
 
@@ -3642,6 +3668,9 @@ function sincronizarDados() {
     // Grava aba de auditoria de duplicatas (sempre, para refletir estado atual)
     _gravarDuplicatasDebug_(duplicatasDebug);
 
+    // Sentinela: confere o estado final do DB e sinaliza qualquer duplicidade remanescente
+    _registrarSentinelaDuplicatas_();
+
     // Retorna contadores para o processo automático decidir se limpa cache
     return {
       novos: novosValidados.length,
@@ -4602,6 +4631,14 @@ function fetchAllDataUnified(cacheBuster) {
     }
     result.avisosPendentes = avisosPendentes;
 
+    // Alerta da sentinela de duplicidade (gravado ao fim de cada sincronização)
+    try {
+      const alertaDup = spFetch.getProperty('ALERTA_DUPLICATAS');
+      if (alertaDup) result.alertaDuplicatas = JSON.parse(alertaDup);
+    } catch (eDup) {
+      Logger.log(`   ⚠️ Alerta de duplicidade ilegível: ${eDup.message}`);
+    }
+
     salvarDadosCache(result);
     return JSON.parse(JSON.stringify(result)); // garante tipos JSON puros
     
@@ -5328,6 +5365,135 @@ function corrigirFaturadosComSaldoAberto() {
   Logger.log(`✅ corrigirFaturadosComSaldoAberto: ${corrigidos} item(ns) corrigido(s).`);
 }
 
+// ====== SENTINELA DE DUPLICIDADE ======
+/**
+ * Varre o Relatorio_DB atrás de qualquer duplicidade e devolve um resumo.
+ * Roda ao fim de toda sincronização: as travas do sync impedem os casos conhecidos, mas se
+ * um caminho novo escapar, o problema aparece no log e no HTML no mesmo ciclo — em vez de
+ * ser descoberto visualmente semanas depois, com centenas de linhas já acumuladas.
+ *
+ * Três verificações:
+ *   1. ID_UNICO repetido    — duas linhas disputando a mesma identidade no sistema;
+ *   2. CÓDIGO_FIXO repetido — mesmo UUID em linhas diferentes;
+ *   3. mesmo item em aberto em mais de uma ORD. COMPRA — o que o usuário enxerga como
+ *      "a mesma fita em dois pedidos";
+ *   4. linha em aberto sem correspondência em PEDIDOS cujo item já está representado por
+ *      outra linha do DB. Cobre o caso em que a contraparte está Faturado: pela verificação 3
+ *      o par não aparece (só uma das linhas está aberta), mas a linha aberta é um fantasma —
+ *      a fonte não a conhece. Foi exatamente o caso da fita 124428 nas OCs 15911338/15912541.
+ *
+ * @returns {{ok: boolean, idsRepetidos: number, uuidsRepetidos: number, itensEmVariasOCs: number, orfasRedundantes: number, exemplos: Array}}
+ */
+function _verificarIntegridadeDuplicatas_() {
+  const vazio = { ok: true, idsRepetidos: 0, uuidsRepetidos: 0, itensEmVariasOCs: 0, orfasRedundantes: 0, exemplos: [] };
+  try {
+    const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
+    if (!sheet || sheet.getLastRow() < 2) return vazio;
+
+    const lastCol = Math.max(sheet.getLastColumn(), DB_CODIGO_FIXO_COL + 1);
+    const dados = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastCol).getValues();
+
+    // IDs e UUIDs vivos em PEDIDOS — para separar "linha que a fonte conhece" de fantasma
+    const peIds = new Set(), peUuids = new Set();
+    try {
+      const ps = getSpreadsheet_().getSheetByName(FONTE_SHEET_NAME);
+      if (ps && ps.getLastRow() >= FONTE_DATA_START_ROW) {
+        ps.getRange(FONTE_DATA_START_ROW, 1, ps.getLastRow() - FONTE_DATA_START_ROW + 1, PEDIDOS_CODIGO_FIXO_COL + 1)
+          .getValues().forEach(r => {
+            if (!r[CARTELA_COL] || String(r[CARTELA_COL]).trim() === '') return;
+            const pid = String(r[ID_COL] || '').trim();               if (pid) peIds.add(pid);
+            const pu  = String(r[PEDIDOS_CODIGO_FIXO_COL] || '').trim(); if (pu) peUuids.add(pu);
+          });
+      }
+    } catch (ep) {
+      Logger.log(`   ⚠️ Sentinela: PEDIDOS ilegível (${ep.message}) — verificação 4 desabilitada`);
+    }
+
+    const porId = new Map(), porUuid = new Map(), porIdentidade = new Map();
+    dados.forEach(row => {
+      const id = String(row[ID_COL] || '').trim();
+      if (!id) return;
+      porId.set(id, (porId.get(id) || 0) + 1);
+
+      const uuid = String(row[DB_CODIGO_FIXO_COL] || '').trim();
+      if (uuid) porUuid.set(uuid, (porUuid.get(uuid) || 0) + 1);
+
+      const ident = _criarImpressaoDigitalSemOC_(row, true);
+      if (!ident) return;
+      if (!porIdentidade.has(ident)) porIdentidade.set(ident, []);
+      // Guarda TODAS as linhas do grupo (inclusive as finalizadas): a verificação 4 precisa
+      // saber se a fonte reconhece alguma linha da identidade, seja qual for o status dela.
+      const st = String(row[STATUS_COL] || '').trim();
+      porIdentidade.get(ident).push({
+        row: row,
+        aberta: !(st === 'Faturado' || st === 'Finalizado' || st === 'Excluido'),
+        naFonte: peIds.has(id) || (uuid && peUuids.has(uuid))
+      });
+    });
+
+    const idsRepetidos  = [...porId.values()].filter(n => n > 1).length;
+    const uuidsRepetidos = [...porUuid.values()].filter(n => n > 1).length;
+
+    const exemplos = [];
+    let itensEmVariasOCs = 0;
+    let orfasRedundantes = 0;
+    porIdentidade.forEach(entradas => {
+      const abertas = entradas.filter(e => e.aberta);
+
+      // 3) mesmo item ABERTO em mais de uma OC
+      const ocsAbertas = [...new Set(abertas.map(e => String(e.row[DB_OC_COL] || '').trim()))];
+      const duplicadoEmOCs = (abertas.length >= 2 && ocsAbertas.length >= 2);
+      if (duplicadoEmOCs) itensEmVariasOCs++;
+
+      // 4) linha aberta que a fonte não conhece, tendo outra linha do grupo reconhecida
+      const reconhecidas = entradas.filter(e => e.naFonte).length;
+      const fantasmas = (reconhecidas > 0) ? abertas.filter(e => !e.naFonte) : [];
+      orfasRedundantes += fantasmas.length;
+
+      if ((duplicadoEmOCs || fantasmas.length > 0) && exemplos.length < 5) {
+        const base = entradas[0].row;
+        exemplos.push({
+          pedido: String(base[DB_PEDIDO_COL] || '').trim(),
+          codCliente: String(base[DB_CODCLI_COL] || '').trim(),
+          marfim: String(base[DB_MARFIM_COL] || '').trim(),
+          ocs: [...new Set(entradas.map(e => String(e.row[DB_OC_COL] || '').trim()))]
+        });
+      }
+    });
+
+    const ok = (idsRepetidos === 0 && uuidsRepetidos === 0 && itensEmVariasOCs === 0 && orfasRedundantes === 0);
+    return { ok: ok, idsRepetidos: idsRepetidos, uuidsRepetidos: uuidsRepetidos, itensEmVariasOCs: itensEmVariasOCs, orfasRedundantes: orfasRedundantes, exemplos: exemplos };
+  } catch (e) {
+    Logger.log(`⚠️ _verificarIntegridadeDuplicatas_: ${e.message}`);
+    return vazio;
+  }
+}
+
+/**
+ * Roda a sentinela e persiste o resultado em ALERTA_DUPLICATAS para o HTML exibir.
+ * Limpa a propriedade quando está tudo certo, para o aviso sumir sozinho após a correção.
+ */
+function _registrarSentinelaDuplicatas_() {
+  const r = _verificarIntegridadeDuplicatas_();
+  const props = PropertiesService.getScriptProperties();
+  if (r.ok) {
+    props.deleteProperty('ALERTA_DUPLICATAS');
+    Logger.log('   🛡️ Sentinela de duplicidade: nenhuma duplicidade no Relatorio_DB');
+    return r;
+  }
+  props.setProperty('ALERTA_DUPLICATAS', JSON.stringify({
+    idsRepetidos: r.idsRepetidos,
+    uuidsRepetidos: r.uuidsRepetidos,
+    itensEmVariasOCs: r.itensEmVariasOCs,
+    orfasRedundantes: r.orfasRedundantes,
+    exemplos: r.exemplos,
+    detectadoEm: new Date().toISOString()
+  }));
+  Logger.log(`   🚨 SENTINELA: ${r.idsRepetidos} ID_UNICO repetido(s), ${r.uuidsRepetidos} CÓDIGO_FIXO repetido(s), ${r.itensEmVariasOCs} item(ns) aberto(s) em mais de uma OC, ${r.orfasRedundantes} linha(s) aberta(s) sem correspondência em PEDIDOS`);
+  r.exemplos.forEach(e => Logger.log(`      • pedido ${e.pedido} cód.cliente ${e.codCliente} marfim ${e.marfim} → OCs ${e.ocs.join(', ')}`));
+  return r;
+}
+
 // ====== ITENS DUPLICADOS EM DUAS ORDENS DE COMPRA ======
 
 /**
@@ -5713,4 +5879,27 @@ function registrarAcesso(usuario, tipo) {
   } catch (e) {
     Logger.log('❌ registrarAcesso: ' + e.message);
   }
+}
+
+/**
+ * Roda a sentinela de duplicidade sob demanda, pelo menu.
+ */
+function verificarDuplicidadeAgora() {
+  const ui = SpreadsheetApp.getUi();
+  const r = _registrarSentinelaDuplicatas_();
+  if (r.ok) {
+    ui.alert('🛡️ Nenhuma duplicidade', `O ${DB_SHEET_NAME} está íntegro:\n\n• Nenhum ID_UNICO repetido\n• Nenhum CÓDIGO_FIXO repetido\n• Nenhum item em aberto em mais de uma ORD. COMPRA\n• Nenhuma linha aberta sem correspondência em PEDIDOS`, ui.ButtonSet.OK);
+    return;
+  }
+  const amostra = r.exemplos.map(e => `• pedido ${e.pedido} · cód. cliente ${e.codCliente} → OCs ${e.ocs.join(' e ')}`).join('\n');
+  ui.alert(
+    '🚨 Duplicidade detectada',
+    `• ${r.idsRepetidos} ID_UNICO repetido(s)\n` +
+    `• ${r.uuidsRepetidos} CÓDIGO_FIXO repetido(s)\n` +
+    `• ${r.itensEmVariasOCs} item(ns) em aberto em mais de uma ORD. COMPRA\n` +
+    `• ${r.orfasRedundantes} linha(s) aberta(s) sem correspondência em PEDIDOS\n\n` +
+    (amostra ? amostra + '\n\n' : '') +
+    'Use "Diagnosticar itens duplicados em 2 OCs" para o relatório completo.',
+    ui.ButtonSet.OK
+  );
 }
