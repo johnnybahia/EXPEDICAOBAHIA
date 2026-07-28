@@ -2595,8 +2595,13 @@ function _criarImpressaoDigital_(row, isDbRow) {
  * Esta chave permite reconhecer que é o MESMO item físico e apenas atualizar a linha
  * existente com a nova OC.
  *
- * Retorna '' quando faltam identificadores fortes (PEDIDO, CÓD. MARFIM, CÓD. OS ou
- * DATA RECEB.): sem eles a chave seria ampla demais e poderia casar itens distintos.
+ * Retorna '' quando faltam identificadores fortes (PEDIDO, CÓD. MARFIM ou DATA RECEB.):
+ * sem eles a chave seria ampla demais e poderia casar itens distintos.
+ *
+ * O CÓD. OS entra na chave mas NÃO é obrigatório: nos dados reais há itens legítimos com
+ * OS vazio (BIBI, MARFIM PERDIGÃO) que ficavam de fora da detecção. A ambiguidade continua
+ * coberta por quem consome a chave — a migração de OC só é aplicada quando existe
+ * exatamente um candidato livre em PEDIDOS.
  */
 function _criarImpressaoDigitalSemOC_(row, isDbRow) {
   const pedidoIdx = isDbRow ? 3  : PEDIDO_COL;
@@ -2612,7 +2617,7 @@ function _criarImpressaoDigitalSemOC_(row, isDbRow) {
   const _marfim_  = _normalizarMarfimDilly_(String(row[marfimIdx] || '').trim(), _tam_, _cliente_);
   const _dtrec_   = _normalizarData_(row[dtrecIdx]);
 
-  if (!_cliente_ || !_pedido_ || !_marfim_ || !_os_ || !_dtrec_) return '';
+  if (!_cliente_ || !_pedido_ || !_marfim_ || !_dtrec_) return '';
 
   return [_cliente_, _pedido_, _marfim_, _tam_, _os_, _dtrec_].join('|');
 }
@@ -3944,15 +3949,23 @@ function limparDuplicatasOrfasDB() {
       return;
     }
 
-    // Fingerprint SEM OS — mesma chave do pedidosDillyMap (o OS/Lote é o campo instável
-    // que diferenciava as duplicatas entre si; sem ele as cópias do mesmo item se agrupam).
-    const fpSemOS = (cliente, pedido, marfim, tam, oc, dtrec) => {
+    // Chave de identidade SEM OS e SEM OC — os dois campos que mudam quando o item é o mesmo:
+    //   • OS  é instável para Dilly (em PEDIDOS vira o Lote da aba LOTE DILLY);
+    //   • OC  muda quando o sistema de origem move o item para outra ordem de compra, e como
+    //         ela está dentro do ID_UNICO e da impressão digital padrão, o item vira "órfã +
+    //         item novo" — o caso observado nos dados reais da Bahia (61 das 68 órfãs Ativo).
+    // Manter a OC na chave (como no motor do Ceará, cujas duplicatas eram todas dentro da
+    // MESMA OC) faz a quota da órfã dar zero e nenhuma linha ser selecionada.
+    // A chave mais ampla é segura porque a decisão de remover não depende só dela: a linha
+    // precisa ser órfã de ID E de UUID, sem marcações, sem baixas, e o grupo precisa ter mais
+    // linhas ativas no DB do que na fonte — com teto de remoção igual a esse excedente.
+    const fpIdentidade = (cliente, pedido, marfim, tam, dtrec) => {
       const c = String(cliente || '').trim();
       const t = String(tam || '').trim();
-      return `${c}|${String(pedido || '').trim()}|${_normalizarMarfimDilly_(String(marfim || '').trim(), t, c)}|${t}|${String(oc || '').trim()}|${_normalizarData_(dtrec)}`;
+      return `${c}|${String(pedido || '').trim()}|${_normalizarMarfimDilly_(String(marfim || '').trim(), t, c)}|${t}|${_normalizarData_(dtrec)}`;
     };
 
-    // 1) PEDIDOS: IDs, UUIDs e quota de linhas por fingerprint sem OS
+    // 1) PEDIDOS: IDs, UUIDs e quota de linhas por chave de identidade
     const pedidosData = pedidosSheet.getRange(FONTE_DATA_START_ROW, 1, pedidosSheet.getLastRow() - FONTE_DATA_START_ROW + 1, PEDIDOS_CODIGO_FIXO_COL + 1).getValues();
     const peIds = new Set();
     const peUuids = new Set();
@@ -3963,7 +3976,7 @@ function limparDuplicatasOrfasDB() {
       if (pid) peIds.add(pid);
       const puuid = String(row[PEDIDOS_CODIGO_FIXO_COL] || '').trim();
       if (puuid) peUuids.add(puuid);
-      const fp = fpSemOS(row[CLIENTE_COL], row[PEDIDO_COL], row[MARFIM_COL], row[TAM_COL], row[OC_COL], row[DTREC_COL]);
+      const fp = fpIdentidade(row[CLIENTE_COL], row[PEDIDO_COL], row[MARFIM_COL], row[TAM_COL], row[DTREC_COL]);
       peQuota.set(fp, (peQuota.get(fp) || 0) + 1);
     });
 
@@ -3975,7 +3988,7 @@ function limparDuplicatasOrfasDB() {
         .forEach(r => { if (r[0]) idsComBaixa.add(String(r[0]).trim()); });
     }
 
-    // 3) Relatorio_DB: conta linhas ativas por fingerprint e aplica os critérios
+    // 3) Relatorio_DB: conta linhas ativas por chave de identidade e aplica os critérios
     const numDbRows = dbSheet.getLastRow() - 1;
     const dbCols = Math.min(LOTE_EMISSAO_COL + 1, dbSheet.getMaxColumns());
     const dbData = dbSheet.getRange(2, 1, numDbRows, dbCols).getValues();
@@ -3983,7 +3996,7 @@ function limparDuplicatasOrfasDB() {
     const dbAtivosPorFp = new Map();
     const fpPorLinha = new Array(dbData.length);
     dbData.forEach((row, i) => {
-      const fp = fpSemOS(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[DB_OC_COL], row[11]); // 11 = DATA RECEB. no DB
+      const fp = fpIdentidade(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[11]); // 11 = DATA RECEB. no DB
       fpPorLinha[i] = fp;
       const st = String(row[STATUS_COL] || '').trim();
       if (st !== 'Faturado' && st !== 'Finalizado' && st !== 'Excluido') {
@@ -3993,6 +4006,10 @@ function limparDuplicatasOrfasDB() {
 
     const linhasParaRemover = []; // números de linha na planilha (1-based)
     const auditoria = [];
+    // Teto por grupo: no máximo (ativos - quota) linhas podem ser removidas. Sem isso, um
+    // grupo com 4 ativos no DB para 3 na fonte e 2 órfãs perderia as duas, ficando abaixo
+    // da fonte. Cada remoção consome uma unidade do excedente.
+    const excedentePorFp = new Map();
     dbData.forEach((row, i) => {
       const id = String(row[ID_COL] || '').trim();
       if (!id) return;
@@ -4000,6 +4017,8 @@ function limparDuplicatasOrfasDB() {
       const quota = peQuota.get(fp) || 0;
       const ativos = dbAtivosPorFp.get(fp) || 0;
       if (quota === 0 || ativos <= quota) return; // grupo sem excesso, ou item saiu da fonte
+      if (!excedentePorFp.has(fp)) excedentePorFp.set(fp, ativos - quota);
+      if (excedentePorFp.get(fp) <= 0) return;    // excedente do grupo já esgotado
       if (String(row[STATUS_COL] || '').trim() !== 'Ativo') return;
       if (String(row[MARCAR_FATURAR_COL] || '').trim() !== '') return;
       if (String(row[MARCAR_FATURAR_USUARIO_COL] || '').trim() !== '') return;
@@ -4009,6 +4028,7 @@ function limparDuplicatasOrfasDB() {
       if (uuid && peUuids.has(uuid)) return;
       if (idsComBaixa.has(id)) return; // tem histórico de baixas
 
+      excedentePorFp.set(fp, excedentePorFp.get(fp) - 1);
       linhasParaRemover.push(i + 2);
       auditoria.push([
         new Date(), 'Órfã removida (limpeza de duplicatas)', id, Number(row[DB_QTD_COL] || 0),
@@ -5251,43 +5271,62 @@ function _agruparItensDuplicadosDB_() {
   const lastCol = Math.max(sheet.getLastColumn(), DB_CODIGO_FIXO_COL + 1);
   const dados   = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
 
-  const porChave = new Map(); // chave → { motivo, itens: [] }
+  // Duas indexações INDEPENDENTES. A versão anterior usava o UUID como chave sempre que
+  // presente e caía na impressão digital só quando ele faltava — inútil na prática, porque
+  // toda linha do DB tem CÓDIGO_FIXO e cada cópia recebe um UUID próprio ao ser criada:
+  // duas cópias do mesmo item nunca caíam no mesmo grupo. Agora o agrupamento por identidade
+  // roda sempre, e o UUID repetido (defeito distinto e mais raro) é reportado à parte.
+  const porIdentidade = new Map(); // impressão sem OC → itens
+  const porUuid       = new Map(); // CÓDIGO_FIXO      → itens
+
+  const _item_ = (row, i) => ({
+    linha:      i + 2,
+    row:        row,
+    uniqueId:   String(row[ID_COL] || '').trim(),
+    status:     String(row[STATUS_COL]   || '').trim(),
+    oc:         String(row[DB_OC_COL]    || '').trim(),
+    os:         String(row[10]           || '').trim(),
+    cliente:    String(row[CLIENTE_COL]  || '').trim(),
+    pedido:     String(row[DB_PEDIDO_COL]|| '').trim(),
+    marfim:     String(row[DB_MARFIM_COL]|| '').trim(),
+    tamanho:    String(row[DB_TAM_COL]   || '').trim(),
+    qtdAberta:  _toNumber_(row[DB_QTD_COL])
+  });
+
   dados.forEach((row, i) => {
-    const uniqueId = String(row[ID_COL] || '').trim();
-    if (!uniqueId) return;
+    if (!String(row[ID_COL] || '').trim()) return;
+    const it = _item_(row, i);
+
+    const fpSemOc = _criarImpressaoDigitalSemOC_(row, true);
+    if (fpSemOc) {
+      if (!porIdentidade.has(fpSemOc)) porIdentidade.set(fpSemOc, []);
+      porIdentidade.get(fpSemOc).push(it);
+    }
 
     const codigoFixo = String(row[DB_CODIGO_FIXO_COL] || '').trim();
-    const fpSemOc    = _criarImpressaoDigitalSemOC_(row, true);
-    // UUID é o identificador mais forte; a impressão sem OC é o fallback
-    const chave  = codigoFixo ? `UUID:${codigoFixo}` : (fpSemOc ? `FP:${fpSemOc}` : '');
-    if (!chave) return;
-
-    if (!porChave.has(chave)) {
-      porChave.set(chave, { chave: chave, motivo: codigoFixo ? 'CÓDIGO_FIXO igual' : 'Mesmo item, OC diferente', itens: [] });
+    if (codigoFixo) {
+      if (!porUuid.has(codigoFixo)) porUuid.set(codigoFixo, []);
+      porUuid.get(codigoFixo).push(it);
     }
-    porChave.get(chave).itens.push({
-      linha:      i + 2,
-      row:        row,
-      uniqueId:   uniqueId,
-      status:     String(row[STATUS_COL]   || '').trim(),
-      oc:         String(row[DB_OC_COL]    || '').trim(),
-      os:         String(row[10]           || '').trim(),
-      cliente:    String(row[CLIENTE_COL]  || '').trim(),
-      pedido:     String(row[DB_PEDIDO_COL]|| '').trim(),
-      marfim:     String(row[DB_MARFIM_COL]|| '').trim(),
-      tamanho:    String(row[DB_TAM_COL]   || '').trim(),
-      qtdAberta:  _toNumber_(row[DB_QTD_COL])
-    });
   });
 
   const grupos = [];
-  porChave.forEach(g => {
-    if (g.itens.length < 2) return;
-    // Só interessa quando as cópias estão em ORDENS DE COMPRA diferentes — duplicatas
-    // dentro da mesma OC podem ser itens legítimos repetidos no pedido.
-    const ocs = new Set(g.itens.map(it => it.oc));
-    if (ocs.size < 2) return;
-    grupos.push(g);
+  const linhasJaAgrupadas = new Set();
+
+  // 1) Mesmo item em ORDENS DE COMPRA diferentes — duplicatas dentro da mesma OC podem ser
+  //    itens legítimos repetidos no pedido, então exigimos OCs distintas.
+  porIdentidade.forEach((itens, chave) => {
+    if (itens.length < 2) return;
+    if (new Set(itens.map(it => it.oc)).size < 2) return;
+    itens.forEach(it => linhasJaAgrupadas.add(it.linha));
+    grupos.push({ chave: `FP:${chave}`, motivo: 'Mesmo item, OC diferente', itens: itens });
+  });
+
+  // 2) CÓDIGO_FIXO repetido — sempre um defeito, independente da OC.
+  porUuid.forEach((itens, chave) => {
+    if (itens.length < 2) return;
+    if (itens.every(it => linhasJaAgrupadas.has(it.linha))) return; // já reportado acima
+    grupos.push({ chave: `UUID:${chave}`, motivo: 'CÓDIGO_FIXO repetido', itens: itens });
   });
 
   return { grupos: grupos, linhas: dados.length };
