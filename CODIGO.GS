@@ -911,6 +911,9 @@ function onOpen() {
     .addItem('🧹 Confirmar todos os alertas de faturamento (testes)', 'confirmarTodosAlertasMenu')
     .addItem('🔧 Corrigir Faturados com saldo aberto (reverter para Ativo)', 'corrigirFaturadosComSaldoAberto')
     .addSeparator()
+    .addItem('🔎 Diagnosticar itens duplicados em 2 OCs', 'diagnosticarItensDuplicadosOC')
+    .addItem('🧹 Arquivar duplicatas órfãs (Faturado na OC errada)', 'arquivarDuplicatasOrfas')
+    .addSeparator()
     .addItem('⚠️ RESET COMPLETO (apaga DB + regenera IDs)', 'resetarEReprocessar')
     .addSeparator()
     .addItem('🔄 Forçar resync agora (aplica correções Dilly)', 'forcarResyncDilly')
@@ -2550,6 +2553,41 @@ function _criarImpressaoDigital_(row, isDbRow) {
 }
 
 /**
+ * Variante da impressão digital que IGNORA a ORD. COMPRA.
+ *
+ * Motivo: tanto o ID_UNICO quanto a impressão digital padrão embutem a OC. Quando o
+ * sistema de origem move uma linha de uma OC para outra, o item deixa de ser
+ * reconhecível por ID, por UUID (o CÓDIGO_FIXO é regerado junto com o ID novo) e pela
+ * impressão digital padrão. O sync então trata a linha antiga como "saiu do PEDIDOS"
+ * (podendo marcá-la Faturado) e insere a linha nova como item novo — resultado: o mesmo
+ * item aparece em DUAS OCs no HTML, uma delas com o selo FATURADO indevido.
+ *
+ * Esta chave permite reconhecer que é o MESMO item físico e apenas atualizar a linha
+ * existente com a nova OC.
+ *
+ * Retorna '' quando faltam identificadores fortes (PEDIDO, CÓD. MARFIM, CÓD. OS ou
+ * DATA RECEB.): sem eles a chave seria ampla demais e poderia casar itens distintos.
+ */
+function _criarImpressaoDigitalSemOC_(row, isDbRow) {
+  const pedidoIdx = isDbRow ? 3  : PEDIDO_COL;
+  const marfimIdx = isDbRow ? 5  : MARFIM_COL;
+  const tamIdx    = isDbRow ? 7  : TAM_COL;
+  const osIdx     = isDbRow ? 10 : OS_COL;
+  const dtrecIdx  = isDbRow ? 11 : DTREC_COL;
+
+  const _cliente_ = String(row[CLIENTE_COL] || '').trim();
+  const _pedido_  = String(row[pedidoIdx]   || '').trim();
+  const _tam_     = String(row[tamIdx]      || '').trim();
+  const _os_      = String(row[osIdx]       || '').trim();
+  const _marfim_  = _normalizarMarfimDilly_(String(row[marfimIdx] || '').trim(), _tam_, _cliente_);
+  const _dtrec_   = _normalizarData_(row[dtrecIdx]);
+
+  if (!_cliente_ || !_pedido_ || !_marfim_ || !_os_ || !_dtrec_) return '';
+
+  return [_cliente_, _pedido_, _marfim_, _tam_, _os_, _dtrec_].join('|');
+}
+
+/**
  * Cria um Map de impressões digitais do Relatorio_DB.
  * Retorna: Map<impressao_digital, {id, linha, row}>
  */
@@ -2674,13 +2712,25 @@ function sincronizarDados() {
     // FIX Bug 2: era Map simples (sobrescrevia duplicatas); agora guarda array e consome um slot por vez.
     const fonteImpressoes = new Map();
     const fonteImpressoesCount = new Map(); // fingerprint → quantas vezes aparece em PEDIDOS
+    // Map<impressaoSemOC, [slot]> — MESMOS objetos de fonteImpressoes, para que o flag
+    // "usado" seja compartilhado: um slot consumido por qualquer caminho fica indisponível
+    // para os demais. Usado para detectar itens que mudaram de ORD. COMPRA.
+    const fonteImpressoesSemOC = new Map();
     for (let [id, row] of fonteMap.entries()) {
       const impressao = _criarImpressaoDigital_(row);
+      const slot = { id: id, row: row, usado: false };
       if (!fonteImpressoes.has(impressao)) fonteImpressoes.set(impressao, []);
-      fonteImpressoes.get(impressao).push({ id: id, row: row, usado: false });
+      fonteImpressoes.get(impressao).push(slot);
       fonteImpressoesCount.set(impressao, (fonteImpressoesCount.get(impressao) || 0) + 1);
+
+      const impressaoSemOc = _criarImpressaoDigitalSemOC_(row);
+      if (impressaoSemOc) {
+        if (!fonteImpressoesSemOC.has(impressaoSemOc)) fonteImpressoesSemOC.set(impressaoSemOc, []);
+        fonteImpressoesSemOC.get(impressaoSemOc).push(slot);
+      }
     }
     Logger.log(`   ✓ ${fonteImpressoes.size} impressões digitais únicas criadas para PEDIDOS`);
+    Logger.log(`   ✓ ${fonteImpressoesSemOC.size} impressões digitais sem OC (detecção de troca de ORD. COMPRA)`);
 
     // Map<impressao, {id, linha, row}> para Relatorio_DB (usado só para cheque de duplicatas em novos itens)
     const dbImpressoes = new Map();
@@ -2999,13 +3049,37 @@ function sincronizarDados() {
           const impressaoDB = _criarImpressaoDigital_(dbItem.row, true); // row do Relatorio_DB
           // FIX Bug 2: era fonteImpressoes.get() (sobrescrevia duplicatas); agora encontra primeiro slot livre.
           const fonteItens = fonteImpressoes.get(impressaoDB);
-          const fonteItem = fonteItens ? fonteItens.find(i => !i.usado) : null;
+          let fonteItem = fonteItens ? fonteItens.find(i => !i.usado) : null;
+          let migrouDeOc = false;
+
+          // QUARTA TENTATIVA: o item pode ter sido MOVIDO para outra ORD. COMPRA.
+          // ID, CÓDIGO_FIXO e impressão digital padrão embutem a OC, então todos falham
+          // nesse caso e o item seria contado como "saiu do PEDIDOS" (marcado Faturado)
+          // enquanto a linha da nova OC entrava como item novo — duplicando o item no HTML.
+          // Só aceita quando há exatamente UM candidato livre: com mais de um não há como
+          // saber qual linha corresponde a qual, e o comportamento antigo é mantido.
+          if (!fonteItem) {
+            const impressaoSemOcDB = _criarImpressaoDigitalSemOC_(dbItem.row, true);
+            const livresSemOc = impressaoSemOcDB
+              ? (fonteImpressoesSemOC.get(impressaoSemOcDB) || []).filter(f => !f.usado)
+              : [];
+            if (livresSemOc.length === 1) {
+              fonteItem = livresSemOc[0];
+              migrouDeOc = true;
+            } else if (livresSemOc.length > 1) {
+              Logger.log(`   ⚠️ Troca de OC ambígua (${livresSemOc.length} candidatos em PEDIDOS) para ID="${id}" — não aplicada`);
+            }
+          }
 
           if (fonteItem) {
             // ENCONTROU POR FINGERPRINT! O ID mudou devido ao IMPORTRANGE
             fonteItem.usado = true; // consome este slot sem apagar outros com a mesma fingerprint
             const novoId = fonteItem.id;
-            Logger.log(`   🔄 ID atualizado por fingerprint: "${id}" → "${novoId}" (Linha ${dbItem.linha})`);
+            if (migrouDeOc) {
+              Logger.log(`   🔀 Item mudou de ORD. COMPRA: "${dbItem.row[DB_OC_COL]}" → "${fonteItem.row[OC_COL]}" — linha ${dbItem.linha} atualizada (ID "${id}" → "${novoId}")`);
+            } else {
+              Logger.log(`   🔄 ID atualizado por fingerprint: "${id}" → "${novoId}" (Linha ${dbItem.linha})`);
+            }
 
             const fonteRow = fonteItem.row;
             let marcarFaturarAtual = dbItem.row[MARCAR_FATURAR_COL] || "";
@@ -3043,7 +3117,7 @@ function sincronizarDados() {
             const novoStatus = (statusAtual === "Faturado" || statusAtual === "Finalizado") ? statusAtual : "Ativo";
             novaLinha[STATUS_COL] = novoStatus;
 
-            updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus });
+            updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: novoId });
             idsAtualizados.push({ de: id, para: novoId, linha: dbItem.linha });
 
             // Remove do fonteMap para não adicionar como novo depois.
@@ -4895,6 +4969,233 @@ function corrigirFaturadosComSaldoAberto() {
   limparCache();
   ui.alert('✅ Correção concluída', `${corrigidos} item(ns) revertido(s) de Faturado → Ativo por ter QTD.ABERTA > 0.`, ui.ButtonSet.OK);
   Logger.log(`✅ corrigirFaturadosComSaldoAberto: ${corrigidos} item(ns) corrigido(s).`);
+}
+
+// ====== ITENS DUPLICADOS EM DUAS ORDENS DE COMPRA ======
+
+/**
+ * Agrupa as linhas do Relatorio_DB pelo MESMO item físico, ignorando a ORD. COMPRA.
+ *
+ * Duas linhas são consideradas o mesmo item quando compartilham o CÓDIGO_FIXO (UUID) ou
+ * a impressão digital sem OC (CLIENTE|PEDIDO|CÓD. MARFIM|TAMANHO|CÓD. OS|DATA RECEB.).
+ * Linhas sem identificadores fortes o bastante para uma chave confiável são ignoradas.
+ *
+ * @returns {{grupos: Array, linhas: number}} grupos com 2+ linhas, cada um {chave, motivo, itens[]}
+ */
+function _agruparItensDuplicadosDB_() {
+  const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() < 2) return { grupos: [], linhas: 0 };
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = Math.max(sheet.getLastColumn(), DB_CODIGO_FIXO_COL + 1);
+  const dados   = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const porChave = new Map(); // chave → { motivo, itens: [] }
+  dados.forEach((row, i) => {
+    const uniqueId = String(row[ID_COL] || '').trim();
+    if (!uniqueId) return;
+
+    const codigoFixo = String(row[DB_CODIGO_FIXO_COL] || '').trim();
+    const fpSemOc    = _criarImpressaoDigitalSemOC_(row, true);
+    // UUID é o identificador mais forte; a impressão sem OC é o fallback
+    const chave  = codigoFixo ? `UUID:${codigoFixo}` : (fpSemOc ? `FP:${fpSemOc}` : '');
+    if (!chave) return;
+
+    if (!porChave.has(chave)) {
+      porChave.set(chave, { chave: chave, motivo: codigoFixo ? 'CÓDIGO_FIXO igual' : 'Mesmo item, OC diferente', itens: [] });
+    }
+    porChave.get(chave).itens.push({
+      linha:      i + 2,
+      row:        row,
+      uniqueId:   uniqueId,
+      status:     String(row[STATUS_COL]   || '').trim(),
+      oc:         String(row[DB_OC_COL]    || '').trim(),
+      os:         String(row[10]           || '').trim(),
+      cliente:    String(row[CLIENTE_COL]  || '').trim(),
+      pedido:     String(row[DB_PEDIDO_COL]|| '').trim(),
+      marfim:     String(row[DB_MARFIM_COL]|| '').trim(),
+      tamanho:    String(row[DB_TAM_COL]   || '').trim(),
+      qtdAberta:  _toNumber_(row[DB_QTD_COL])
+    });
+  });
+
+  const grupos = [];
+  porChave.forEach(g => {
+    if (g.itens.length < 2) return;
+    // Só interessa quando as cópias estão em ORDENS DE COMPRA diferentes — duplicatas
+    // dentro da mesma OC podem ser itens legítimos repetidos no pedido.
+    const ocs = new Set(g.itens.map(it => it.oc));
+    if (ocs.size < 2) return;
+    grupos.push(g);
+  });
+
+  return { grupos: grupos, linhas: dados.length };
+}
+
+/**
+ * DIAGNÓSTICO (somente leitura): lista no log e na aba "Duplicatas_OC_Diagnostico"
+ * os itens que aparecem em mais de uma ORD. COMPRA no Relatorio_DB — a causa de um
+ * mesmo item ser exibido em dois cards no HTML, às vezes com o selo FATURADO na OC
+ * à qual ele não pertence.
+ *
+ * Não altera nenhum dado.
+ */
+function diagnosticarItensDuplicadosOC() {
+  const ui = SpreadsheetApp.getUi();
+  const { grupos, linhas } = _agruparItensDuplicadosDB_();
+
+  const SHEET_NAME = 'Duplicatas_OC_Diagnostico';
+  let sheet = getSpreadsheet_().getSheetByName(SHEET_NAME);
+  if (!sheet) sheet = getSpreadsheet_().insertSheet(SHEET_NAME);
+  sheet.clearContents();
+
+  const cabecalho = [
+    'GRUPO', 'MOTIVO', 'LINHA_DB', 'ID_UNICO', 'STATUS', 'ORD. COMPRA',
+    'CLIENTE', 'PEDIDO', 'CÓD. MARFIM', 'TAMANHO', 'CÓD. OS', 'QTD. ABERTA', 'AVALIAÇÃO'
+  ];
+  sheet.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho])
+    .setFontWeight('bold').setBackground('#f0f2f5');
+
+  const saida = [];
+  let comFaturadoFantasma = 0;
+
+  grupos.forEach((g, idx) => {
+    const temFaturado = g.itens.some(it => it.status === 'Faturado');
+    const temAtivo    = g.itens.some(it => it.status === 'Ativo' || it.status === 'Inativo');
+    const fantasma    = temFaturado && temAtivo;
+    if (fantasma) comFaturadoFantasma++;
+
+    g.itens.forEach(it => {
+      let avaliacao = 'Duplicado em OCs diferentes';
+      if (fantasma) {
+        avaliacao = (it.status === 'Faturado')
+          ? '⚠️ Provável cópia órfã (marcada Faturado na OC antiga)'
+          : '✅ Provável linha correta (OC atual)';
+      }
+      saida.push([
+        idx + 1, g.motivo, it.linha, it.uniqueId, it.status, it.oc,
+        it.cliente, it.pedido, it.marfim, it.tamanho, it.os, it.qtdAberta, avaliacao
+      ]);
+    });
+  });
+
+  if (saida.length > 0) {
+    sheet.getRange(2, 1, saida.length, cabecalho.length).setValues(saida);
+  }
+  sheet.autoResizeColumns(1, cabecalho.length);
+  SpreadsheetApp.flush();
+
+  Logger.log(`🔎 diagnosticarItensDuplicadosOC: ${linhas} linhas analisadas, ${grupos.length} item(ns) em mais de uma OC, ${comFaturadoFantasma} com cópia marcada Faturado.`);
+
+  ui.alert(
+    grupos.length === 0 ? '✅ Nenhuma duplicata entre OCs' : '🔎 Duplicatas encontradas',
+    `${linhas} linha(s) do ${DB_SHEET_NAME} analisadas.\n\n` +
+    `• ${grupos.length} item(ns) aparecem em mais de uma ORD. COMPRA\n` +
+    `• ${comFaturadoFantasma} deles têm uma cópia marcada como Faturado (o "faturado na OC errada")\n\n` +
+    (grupos.length > 0
+      ? `Detalhes na aba "${SHEET_NAME}".\nPara arquivar automaticamente as cópias órfãs, use o item de menu "Arquivar duplicatas órfãs".`
+      : 'Nada a corrigir.'),
+    ui.ButtonSet.OK
+  );
+}
+
+/**
+ * LIMPEZA: arquiva (Status = Excluido) as cópias órfãs deixadas no Relatorio_DB quando um
+ * item mudou de ORD. COMPRA antes da correção do sync — as linhas que aparecem no HTML
+ * como FATURADO numa OC à qual o item não pertence mais.
+ *
+ * Uma linha só é arquivada quando TODAS estas condições valem, para nunca descartar
+ * trabalho real do usuário:
+ *   • o grupo tem exatamente 2 linhas, em OCs diferentes;
+ *   • uma está Faturado/Inativo e a outra está Ativa (a linha viva);
+ *   • o par OC+OS da cópia NÃO existe mais em DADOS_IMPORTADOS (a OC antiga sumiu da fonte);
+ *   • a cópia não tem nenhuma baixa registrada em Baixas_Historico.
+ *
+ * O status Excluido apenas oculta a linha no HTML — nada é apagado e a reversão é manual.
+ */
+function arquivarDuplicatasOrfas() {
+  const ui = SpreadsheetApp.getUi();
+  const { grupos } = _agruparItensDuplicadosDB_();
+
+  // Pares OC|OS ainda presentes na fonte — provam que a OC antiga continua viva
+  const ocOsNaFonte = new Set();
+  try {
+    const importSheet = getSpreadsheet_().getSheetByName(IMPORTRANGE_SHEET_NAME);
+    if (importSheet && importSheet.getLastRow() >= FONTE_DATA_START_ROW) {
+      const vals = importSheet
+        .getRange(FONTE_DATA_START_ROW, 10, importSheet.getLastRow() - FONTE_DATA_START_ROW + 1, 4)
+        .getDisplayValues();
+      vals.forEach(([oc, , , os]) => ocOsNaFonte.add(`${String(oc || '').trim()}|${String(os || '').trim()}`));
+    }
+  } catch (e) {
+    ui.alert('❌ Não foi possível ler DADOS_IMPORTADOS', `${e.message}\n\nOperação cancelada — sem a fonte não é seguro arquivar nada.`, ui.ButtonSet.OK);
+    return;
+  }
+  if (ocOsNaFonte.size === 0) {
+    ui.alert('❌ DADOS_IMPORTADOS vazio', 'Operação cancelada — sem a fonte não é seguro arquivar nada.', ui.ButtonSet.OK);
+    return;
+  }
+
+  // IDs com baixa registrada — nunca arquivar
+  const idsBaixados = new Set();
+  try {
+    const baixasSheet = getSpreadsheet_().getSheetByName(BAIXAS_SHEET_NAME);
+    if (baixasSheet && baixasSheet.getLastRow() > 1) {
+      baixasSheet.getRange(2, 1, baixasSheet.getLastRow() - 1, 1).getValues()
+        .forEach(r => { if (r[0]) idsBaixados.add(String(r[0]).trim()); });
+    }
+  } catch (e) {
+    Logger.log(`⚠️ arquivarDuplicatasOrfas: não foi possível ler ${BAIXAS_SHEET_NAME}: ${e.message}`);
+  }
+
+  const candidatos = [];
+  grupos.forEach(g => {
+    if (g.itens.length !== 2) return;
+    const orfas = g.itens.filter(it => it.status === 'Faturado' || it.status === 'Inativo');
+    const vivas = g.itens.filter(it => it.status === 'Ativo');
+    if (orfas.length !== 1 || vivas.length !== 1) return;
+
+    const orfa = orfas[0];
+    if (orfa.oc === vivas[0].oc) return;
+    if (ocOsNaFonte.has(`${orfa.oc}|${orfa.os}`)) return; // OC antiga ainda existe na fonte
+    if (idsBaixados.has(orfa.uniqueId)) return;           // tem baixa registrada
+
+    candidatos.push({ orfa: orfa, viva: vivas[0] });
+  });
+
+  if (candidatos.length === 0) {
+    ui.alert('✅ Nada a arquivar', 'Nenhuma cópia órfã atende a todos os critérios de segurança.\n\nUse "Diagnosticar itens duplicados" para ver o quadro completo.', ui.ButtonSet.OK);
+    return;
+  }
+
+  const amostra = candidatos.slice(0, 10)
+    .map(c => `• linha ${c.orfa.linha}: OC ${c.orfa.oc} (${c.orfa.status}) → item vive na OC ${c.viva.oc}`)
+    .join('\n');
+  const resposta = ui.alert(
+    '⚠️ Confirmar arquivamento',
+    `${candidatos.length} cópia(s) órfã(s) serão marcadas como Excluido (ocultas no HTML, nada é apagado):\n\n` +
+    amostra + (candidatos.length > 10 ? `\n… e mais ${candidatos.length - 10}.` : '') +
+    '\n\nDeseja continuar?',
+    ui.ButtonSet.YES_NO
+  );
+  if (resposta !== ui.Button.YES) {
+    Logger.log('ℹ️ arquivarDuplicatasOrfas: cancelado pelo usuário.');
+    return;
+  }
+
+  const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
+  const agora = new Date();
+  candidatos.forEach(c => {
+    sheet.getRange(c.orfa.linha, STATUS_COL + 1).setValue('Excluido');
+    sheet.getRange(c.orfa.linha, MARCAR_FATURAR_COL + 1).setValue('');
+    sheet.getRange(c.orfa.linha, DATA_STATUS_COL + 1).setValue(agora);
+    Logger.log(`🧹 Linha ${c.orfa.linha} → Excluido (cópia órfã na OC "${c.orfa.oc}", item ativo na OC "${c.viva.oc}", ID="${c.orfa.uniqueId}")`);
+  });
+
+  SpreadsheetApp.flush();
+  limparCache();
+  ui.alert('✅ Arquivamento concluído', `${candidatos.length} cópia(s) órfã(s) marcada(s) como Excluido.\n\nAtualize o HTML para ver o resultado.`, ui.ButtonSet.OK);
+  Logger.log(`✅ arquivarDuplicatasOrfas: ${candidatos.length} linha(s) arquivada(s).`);
 }
 
 // ====== SISTEMA DE LOGIN COM NÍVEIS DE ACESSO ======
