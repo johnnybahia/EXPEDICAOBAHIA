@@ -2784,6 +2784,29 @@ function sincronizarDados() {
     Logger.log(`   ✓ ${fonteImpressoesSemOC.size} impressões digitais sem OC (detecção de troca de ORD. COMPRA)`);
 
     // Map<impressao, {id, linha, row}> para Relatorio_DB (usado só para cheque de duplicatas em novos itens)
+    // Contagem de identidades SEM OC entre os itens do DB ainda EM ABERTO. Serve de trava na
+    // inserção de novos itens: se a fonte trouxer um item cuja identidade já existe no DB em
+    // aberto e não foi consumida por nenhum match, a linha nova seria uma segunda cópia do
+    // mesmo item em outra ORD. COMPRA. Foi o que aconteceu quando a planilha de origem veio
+    // uma vez com a coluna ORD. COMPRA deslocada em uma linha: 68 cópias entraram de uma só vez.
+    // Só conta itens em aberto — se a contraparte já está Faturado/Finalizado/Excluido, o item
+    // pode legitimamente voltar numa nova OC e a inserção deve passar.
+    const dbIdentidadesAbertas = new Map();
+    for (let [, dbItem] of dbMap.entries()) {
+      const st = String(dbItem.row[STATUS_COL] || '').trim();
+      if (st === 'Faturado' || st === 'Finalizado' || st === 'Excluido') continue;
+      const ident = _criarImpressaoDigitalSemOC_(dbItem.row, true);
+      if (ident) dbIdentidadesAbertas.set(ident, (dbIdentidadesAbertas.get(ident) || 0) + 1);
+    }
+    // Identidades consumidas por algum match — liberam uma vaga para o item novo legítimo
+    // (ex.: o mesmo produto realmente pedido em duas OCs distintas).
+    const consumidasPorIdentidade = new Map();
+    const _consumirIdentidade_ = (row) => {
+      const ident = _criarImpressaoDigitalSemOC_(row, true);
+      if (ident) consumidasPorIdentidade.set(ident, (consumidasPorIdentidade.get(ident) || 0) + 1);
+    };
+    Logger.log(`   ✓ ${dbIdentidadesAbertas.size} identidades sem OC em aberto no DB (trava de inserção)`);
+
     const dbImpressoes = new Map();
     for (let [id, dbItem] of dbMap.entries()) {
       const impressao = _criarImpressaoDigital_(dbItem.row, true); // rows do Relatorio_DB
@@ -3067,6 +3090,7 @@ function sincronizarDados() {
         const fpListId = fonteImpressoes.get(fpFonteId);
         if (fpListId) { const fi = fpListId.find(i => i.id === id); if (fi) fi.usado = true; }
         consumedFingerprints.add(_criarImpressaoDigital_(dbItem.row, true)); // libera fingerprint para novos itens idênticos legítimos
+        _consumirIdentidade_(dbItem.row);
 
       } else {
         // SEGUNDA TENTATIVA: Buscar por CÓDIGO_FIXO (UUID imutável por item — ideia do usuário)
@@ -3125,6 +3149,7 @@ function sincronizarDados() {
           const fpList = fonteImpressoes.get(fpFonte);
           if (fpList) { const fi = fpList.find(i => i.id === novoId); if (fi) fi.usado = true; }
           consumedFingerprints.add(_criarImpressaoDigital_(dbItem.row, true));
+          _consumirIdentidade_(dbItem.row);
 
         } else {
           // Adiada para a Passada 2 (fingerprint + não-encontrado) — ver comentário acima do loop.
@@ -3220,6 +3245,7 @@ function sincronizarDados() {
         // permitindo que outros DB-items com a mesma fingerprint ainda encontrem seus slots.
         fonteMap.delete(novoId);
         consumedFingerprints.add(impressaoDB); // libera fingerprint para novos itens idênticos legítimos
+        _consumirIdentidade_(dbItem.row);
 
       } else {
         // NÃO ENCONTROU por ID, UUID nem fingerprint — item não está em PEDIDOS
@@ -3372,6 +3398,27 @@ function sincronizarDados() {
           fonteRow[OC_COL], fonteRow[DESC_COL], fonteRow[TAM_COL]
         ]);
         continue;
+      }
+
+      // TRAVA DE IDENTIDADE (independente da ORD. COMPRA): se este item já existe no DB EM
+      // ABERTO e nenhuma dessas linhas foi consumida por um match, inserir criaria a mesma
+      // fita/cordão em duas OCs — o item apareceria em dois cards no HTML. É a assinatura de
+      // uma OC divergente entre a fonte e o DB, não de um pedido novo.
+      // Uma vaga consumida libera a inserção: o mesmo produto realmente pedido em duas OCs
+      // distintas tem a primeira linha casada por ID/UUID/fingerprint e a segunda entra normal.
+      const identidadeFonte = _criarImpressaoDigitalSemOC_(fonteRow);
+      if (identidadeFonte) {
+        const abertasDB  = dbIdentidadesAbertas.get(identidadeFonte)   || 0;
+        const consumidas = consumidasPorIdentidade.get(identidadeFonte) || 0;
+        if (abertasDB > consumidas) {
+          Logger.log(`   ⚠️ DUPLICATA EVITADA POR IDENTIDADE: ID="${id}" (OC="${fonteRow[OC_COL]}") já existe no DB em aberto sob outra ORD. COMPRA — ignorado (abertas=${abertasDB}, consumidas=${consumidas})`);
+          duplicatasDebug.push([
+            new Date(), 'Mesmo item já aberto no DB em outra OC', id, '',
+            fonteRow[CARTELA_COL], fonteRow[CLIENTE_COL], fonteRow[PEDIDO_COL],
+            fonteRow[OC_COL], fonteRow[DESC_COL], fonteRow[TAM_COL]
+          ]);
+          continue;
+        }
       }
 
       Logger.log(`   🆕 Novo item: ID="${id}" está em PEDIDOS mas não em Relatorio_DB - será adicionado como Ativo`);
@@ -4004,21 +4051,32 @@ function limparDuplicatasOrfasDB() {
       }
     });
 
+    // Quantas linhas de cada grupo a fonte reconhece (ID ou UUID presente em PEDIDOS).
+    // É o que distingue "o item já está representado no DB" de "o item sumiu da fonte".
+    // Conta linhas de QUALQUER status: quando a contraparte reconhecida já está Faturado,
+    // o grupo não tem excesso de ATIVOS e a regra de quota sozinha não enxerga a órfã —
+    // foi o caso das cópias que apareciam no HTML numa OC e como FATURADO na outra.
+    const cobertasPorFonte = new Map();
+    dbData.forEach((row, i) => {
+      const id = String(row[ID_COL] || '').trim();
+      if (!id) return;
+      const uuid = String(row[DB_CODIGO_FIXO_COL] || '').trim();
+      if (peIds.has(id) || (uuid && peUuids.has(uuid))) {
+        cobertasPorFonte.set(fpPorLinha[i], (cobertasPorFonte.get(fpPorLinha[i]) || 0) + 1);
+      }
+    });
+
     const linhasParaRemover = []; // números de linha na planilha (1-based)
     const auditoria = [];
-    // Teto por grupo: no máximo (ativos - quota) linhas podem ser removidas. Sem isso, um
-    // grupo com 4 ativos no DB para 3 na fonte e 2 órfãs perderia as duas, ficando abaixo
-    // da fonte. Cada remoção consome uma unidade do excedente.
+    // Teto por grupo: no máximo (ativos - quota) linhas podem ser removidas pela regra de
+    // excesso. Sem isso, um grupo com 4 ativos no DB para 3 na fonte e 2 órfãs perderia as
+    // duas, ficando abaixo da fonte. Cada remoção consome uma unidade do excedente.
     const excedentePorFp = new Map();
     dbData.forEach((row, i) => {
       const id = String(row[ID_COL] || '').trim();
       if (!id) return;
-      const fp = fpPorLinha[i];
-      const quota = peQuota.get(fp) || 0;
-      const ativos = dbAtivosPorFp.get(fp) || 0;
-      if (quota === 0 || ativos <= quota) return; // grupo sem excesso, ou item saiu da fonte
-      if (!excedentePorFp.has(fp)) excedentePorFp.set(fp, ativos - quota);
-      if (excedentePorFp.get(fp) <= 0) return;    // excedente do grupo já esgotado
+
+      // Elegibilidade da própria linha — idêntica em todas as regras abaixo
       if (String(row[STATUS_COL] || '').trim() !== 'Ativo') return;
       if (String(row[MARCAR_FATURAR_COL] || '').trim() !== '') return;
       if (String(row[MARCAR_FATURAR_USUARIO_COL] || '').trim() !== '') return;
@@ -4028,10 +4086,28 @@ function limparDuplicatasOrfasDB() {
       if (uuid && peUuids.has(uuid)) return;
       if (idsComBaixa.has(id)) return; // tem histórico de baixas
 
-      excedentePorFp.set(fp, excedentePorFp.get(fp) - 1);
+      const fp     = fpPorLinha[i];
+      const quota  = peQuota.get(fp) || 0;
+      const ativos = dbAtivosPorFp.get(fp) || 0;
+      const cobertas = cobertasPorFonte.get(fp) || 0;
+
+      let motivo = null;
+      if (quota > 0 && cobertas >= quota) {
+        // O item já está representado no DB pelas linhas que a fonte reconhece — esta é
+        // redundante, seja qual for o status da contraparte. Exigir cobertas >= quota evita
+        // remover uma órfã que na verdade cobre uma linha da fonte ainda sem correspondente.
+        motivo = 'Órfã redundante (item já representado pela linha que casa com PEDIDOS)';
+      } else if (quota > 0 && ativos > quota) {
+        if (!excedentePorFp.has(fp)) excedentePorFp.set(fp, ativos - quota);
+        if (excedentePorFp.get(fp) <= 0) return; // excedente do grupo já esgotado
+        excedentePorFp.set(fp, excedentePorFp.get(fp) - 1);
+        motivo = 'Excesso de linhas ativas sobre a fonte';
+      }
+      if (!motivo) return; // item saiu legitimamente da fonte → segue o fluxo de faturamento
+
       linhasParaRemover.push(i + 2);
       auditoria.push([
-        new Date(), 'Órfã removida (limpeza de duplicatas)', id, Number(row[DB_QTD_COL] || 0),
+        new Date(), motivo, id, Number(row[DB_QTD_COL] || 0),
         row[CARTELA_COL], row[CLIENTE_COL], row[DB_PEDIDO_COL],
         row[DB_OC_COL], row[DB_DESC_COL], row[DB_TAM_COL]
       ]);
