@@ -2545,6 +2545,7 @@ ALL_OCS_ITEMS = itemsObj;
         if (alerta.idsRepetidos)     partes.push(`${alerta.idsRepetidos} ID repetido(s)`);
         if (alerta.uuidsRepetidos)   partes.push(`${alerta.uuidsRepetidos} código fixo repetido(s)`);
         if (alerta.orfasRedundantes) partes.push(`${alerta.orfasRedundantes} linha(s) sem correspondência no PEDIDOS`);
+        if (alerta.orfasSemFonte)    partes.push(`${alerta.orfasSemFonte} item(ns) que já saíram da origem e continuam em aberto`);
         if (partes.length === 0) return;
 
         const exemplos = (alerta.exemplos || []).map(e =>
