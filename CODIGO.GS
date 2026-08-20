@@ -2591,55 +2591,29 @@ function _normalizarData_(val) {
 }
 
 /**
- * Normaliza uma DATA RECEB. para a forma canônica 'yyyyMMdd', aceitando os quatro formatos
- * que aparecem no pipeline: objeto Date (getValues do Relatorio_DB), número serial do Sheets,
- * texto 'dd/MM/yyyy' (getDisplayValues do DADOS_IMPORTADOS) e texto 'yyyy-MM-dd'.
+ * Identidade de um item para responder "a fonte ainda conhece este item?":
+ * CLIENTE|PEDIDO|CÓD. MARFIM|TAMANHO.
  *
- * _normalizarData_() não serve aqui: ela devolve o texto cru quando recebe 'dd/MM/yyyy', então
- * a mesma data lida como Date (DB) e como texto (fonte) geraria chaves diferentes.
- * Formato irreconhecível volta como veio — a chave larga (sem data) cobre esse caso.
+ * Diferente da impressão digital, NÃO inclui ORD. COMPRA (a fonte move itens de OC),
+ * CÓD. OS nem DATA RECEB. — e é justamente essa largura que faz a chave funcionar em mm.
+ * Linhas irmãs em mm são cópias perfeitas: 268 das 275 linhas em milímetros da Bahia têm
+ * CÓD. OS = "0" e a mesma DATA RECEB. das irmãs (em cm é o oposto: 1778 de 1790 têm OS
+ * próprio). Uma chave que incluísse OS ou data continuaria "presente na fonte" enquanto
+ * sobrasse UMA irmã, e o item que saiu nunca seria reconhecido como tal.
+ *
+ * A largura é segura porque quem decide não é a chave sozinha e sim a CONTAGEM: só é
+ * faturado o que exceder o número de linhas que a fonte tem para essa identidade.
+ *
+ * @param {string} cliente @param {string} pedido @param {string} marfim @param {string} tam
+ * @returns {string} identidade, ou '' quando não há identificador nenhum
  */
-function _dataChaveFonte_(val) {
-  if (val instanceof Date) {
-    return isNaN(val.getTime()) ? '' : Utilities.formatDate(val, TZ, 'yyyyMMdd');
-  }
-  if (typeof val === 'number' && val > 40000) {
-    try {
-      return Utilities.formatDate(new Date(Math.round((val - 25569) * 86400 * 1000)), TZ, 'yyyyMMdd');
-    } catch (e) { return String(val); }
-  }
-  const s = String(val === null || val === undefined ? '' : val).trim();
-  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (m) return m[3] + String(m[2]).padStart(2, '0') + String(m[1]).padStart(2, '0');
-  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (m) return m[1] + String(m[2]).padStart(2, '0') + String(m[3]).padStart(2, '0');
-  return s;
-}
-
-/**
- * Chaves de identidade de um item para responder "a fonte ainda conhece este item?".
- *
- * Diferente da impressão digital, estas chaves NÃO contêm a ORD. COMPRA — a fonte move itens
- * de OC — e existem em duas larguras:
- *   • tight: CLIENTE|PEDIDO|MARFIM|TAMANHO|CÓD. OS|DATA RECEB. — identifica a LINHA
- *   • loose: CLIENTE|PEDIDO|MARFIM|TAMANHO                     — identifica o PRODUTO no pedido
- *
- * A chave larga existe porque o CÓD. OS é inútil como discriminador justamente nos itens que
- * mais duplicam: 268 das 275 linhas em milímetros da Bahia têm CÓD. OS = "0" ou vazio, contra
- * 1778 de 1790 linhas em centímetros com OS próprio. Sem a chave larga, a decisão de "sumiu da
- * fonte" para item em mm dependeria de um campo constante.
- *
- * @param {string} cliente @param {string} pedido @param {string} marfim
- * @param {string} tam @param {string} os @param {*} dtrec
- * @returns {{tight: string, loose: string}}
- */
-function _chavesIdentidadeItem_(cliente, pedido, marfim, tam, os, dtrec) {
-  const c  = String(cliente || '').trim();
-  const p  = String(pedido  || '').trim();
-  const t  = String(tam     || '').trim();
+function _identidadeItem_(cliente, pedido, marfim, tam) {
+  const c = String(cliente || '').trim();
+  const p = String(pedido  || '').trim();
+  const t = String(tam     || '').trim();
   const mf = _normalizarMarfimDilly_(String(marfim || '').trim(), t, c);
-  const loose = `${c}|${p}|${mf}|${t}`;
-  return { tight: `${loose}|${String(os || '').trim()}|${_dataChaveFonte_(dtrec)}`, loose: loose };
+  if (!c && !p && !mf && !t) return '';
+  return `${c}|${p}|${mf}|${t}`;
 }
 
 function _criarImpressaoDigital_(row, isDbRow) {
@@ -2928,20 +2902,18 @@ function sincronizarDados() {
     // Isso resolve o caso de itens 100% idênticos: se DB tem 3 e PEDIDOS tem 2,
     // após 2 matches o count cai a 0 e o 3º item NÃO é mais protegido → faturamento correto.
     const dadosImportadosOcs = new Map(); // chave: "OC|OS" → contagem de ocorrências
-    // Índices de IDENTIDADE da fonte (sem ORD. COMPRA) — respondem "a fonte ainda conhece
-    // este item?" sem depender do CÓD. OS, que é constante ("0") em quase toda linha em mm.
-    const fonteIdentTight = new Map(); // CLIENTE|PEDIDO|MARFIM|TAM|OS|DATA → contagem
-    const fonteIdentLoose = new Map(); // CLIENTE|PEDIDO|MARFIM|TAM         → contagem
+    // Índice de IDENTIDADE da fonte (CLIENTE|PEDIDO|MARFIM|TAMANHO) — responde "a fonte ainda
+    // conhece este item, e em quantas linhas?" sem depender do CÓD. OS, constante em mm.
+    const fonteIdent = new Map(); // identidade → nº de linhas na fonte
     let fonteLinhasLidas = 0;
     try {
       const importSheet = getSpreadsheet_().getSheetByName(IMPORTRANGE_SHEET_NAME);
       if (importSheet && importSheet.getLastRow() >= FONTE_DATA_START_ROW) {
         const impLastRow = importSheet.getLastRow();
-        // Lê A→N (14 colunas) numa chamada só: CLIENTE=2, PEDIDO=4, MARFIM=6, TAM=8,
-        // OC=9, OS=12, DATA RECEB.=13 (0-based a partir da col A).
-        // getDisplayValues() preserva sufixos de OS como "13807U", "14660U"; a data vem como
-        // texto 'dd/MM/yyyy' e é canonizada por _dataChaveFonte_ para casar com o Date do DB.
-        const vals = importSheet.getRange(FONTE_DATA_START_ROW, 1, impLastRow - FONTE_DATA_START_ROW + 1, 14).getDisplayValues();
+        // Lê A→M (13 colunas) numa chamada só: CARTELA=1, CLIENTE=2, PEDIDO=4, MARFIM=6,
+        // TAM=8, OC=9, OS=12 (0-based a partir da col A).
+        // getDisplayValues() preserva sufixos de OS como "13807U", "14660U".
+        const vals = importSheet.getRange(FONTE_DATA_START_ROW, 1, impLastRow - FONTE_DATA_START_ROW + 1, 13).getDisplayValues();
         vals.forEach(linha => {
           const ocStr = String(linha[9]  || '').trim();
           const osStr = String(linha[12] || '').trim();
@@ -2949,16 +2921,13 @@ function sincronizarDados() {
             const k = `${ocStr}|${osStr}`;
             dadosImportadosOcs.set(k, (dadosImportadosOcs.get(k) || 0) + 1);
           }
-          const cartelaStr = String(linha[1] || '').trim();
-          if (!cartelaStr) return; // mesma regra do resto do pipeline: linha sem CARTELA é ruído
+          if (!String(linha[1] || '').trim()) return; // mesma regra do pipeline: sem CARTELA é ruído
           fonteLinhasLidas++;
-          const ch = _chavesIdentidadeItem_(linha[2], linha[4], linha[6], linha[8], osStr, linha[13]);
-          if (!ch.loose.replace(/\|/g, '')) return; // linha sem nenhum identificador
-          fonteIdentTight.set(ch.tight, (fonteIdentTight.get(ch.tight) || 0) + 1);
-          fonteIdentLoose.set(ch.loose, (fonteIdentLoose.get(ch.loose) || 0) + 1);
+          const ident = _identidadeItem_(linha[2], linha[4], linha[6], linha[8]);
+          if (ident) fonteIdent.set(ident, (fonteIdent.get(ident) || 0) + 1);
         });
         Logger.log(`   ✓ ${dadosImportadosOcs.size} pares OC+OS únicos em DADOS_IMPORTADOS`);
-        Logger.log(`   ✓ ${fonteLinhasLidas} linhas de identidade indexadas (${fonteIdentTight.size} exatas / ${fonteIdentLoose.size} por produto)`);
+        Logger.log(`   ✓ ${fonteLinhasLidas} linhas da fonte em ${fonteIdent.size} identidades de item`);
       } else {
         Logger.log(`   ⚠️ DADOS_IMPORTADOS vazio — proteção desabilitada nesta execução`);
       }
@@ -2987,32 +2956,47 @@ function sincronizarDados() {
     // Efeito observado no Relatorio_DB da Bahia: 237 linhas Ativo que já não existem nem em
     // PEDIDOS nem em DADOS_IMPORTADOS (173 delas em mm) — o item saiu do sistema, continuou
     // aparecendo no card da OC e nunca chegou a "Faturado".
-    const dbAtivosIdentLoose = new Map(); // CLIENTE|PEDIDO|MARFIM|TAM → linhas em aberto no DB
+    const dbAbertasPorIdent = new Map(); // identidade → linhas em aberto no Relatorio_DB
     for (const [, dbi] of dbMap.entries()) {
       const s2 = String(dbi.row[STATUS_COL] || '').trim();
       if (s2 === 'Faturado' || s2 === 'Finalizado' || s2 === 'Excluido') continue;
-      const ch = _chavesIdentidadeItem_(dbi.row[CLIENTE_COL], dbi.row[DB_PEDIDO_COL], dbi.row[DB_MARFIM_COL], dbi.row[DB_TAM_COL], dbi.row[10], dbi.row[11]);
-      dbAtivosIdentLoose.set(ch.loose, (dbAtivosIdentLoose.get(ch.loose) || 0) + 1);
+      const ident = _identidadeItem_(dbi.row[CLIENTE_COL], dbi.row[DB_PEDIDO_COL], dbi.row[DB_MARFIM_COL], dbi.row[DB_TAM_COL]);
+      if (ident) dbAbertasPorIdent.set(ident, (dbAbertasPorIdent.get(ident) || 0) + 1);
     }
+
+    // ORÇAMENTO DE EXCEDENTE por identidade: quantas linhas em aberto o DB tem ALÉM do que a
+    // fonte reconhece. É a régua toda: o DB deve espelhar a fonte, então N linhas abertas para
+    // N-1 linhas na fonte significa exatamente uma linha a mais, e ela é a que não encontrou par.
+    //
+    // A régua NÃO pode exigir que a "linha exata" (chave com CÓD. OS + DATA RECEB.) tenha
+    // sumido: em mm as linhas irmãs são cópias perfeitas — mesmo OS "0", mesma data — então a
+    // chave exata continua presente enquanto sobrar UMA irmã. Era esse o caso mais comum na
+    // Bahia e ele passava batido: 6 linhas no DB para 5 na fonte, indefinidamente.
+    const excedentePorIdent = new Map();
+    dbAbertasPorIdent.forEach((abertas, ident) => {
+      const naFonte = fonteIdent.get(ident) || 0;
+      if (abertas > naFonte) excedentePorIdent.set(ident, abertas - naFonte);
+    });
 
     /**
      * Decide se uma linha do Relatorio_DB corresponde a um item que REALMENTE saiu da fonte.
-     * Só é consultada por linhas que já falharam nos matches por ID, UUID e impressão digital.
-     *   • 'produto_ausente'  — a fonte não tem nenhuma linha com este CLIENTE|PEDIDO|MARFIM|TAM
-     *   • 'linha_excedente'  — a linha exata sumiu E o grupo tem mais linhas em aberto no DB do
-     *                          que a fonte tem linhas: o excedente é este item
-     * Retorna null em qualquer outro caso (a fonte ainda pode reconhecer o item → não mexe).
+     * Só é consultada por linhas que já falharam nos matches por ID, UUID e impressão digital —
+     * ou seja, a linha já não tem par possível na fonte. Devolve motivo só enquanto houver
+     * excedente no grupo, e consome uma unidade dele: com 6 linhas no DB para 5 na fonte,
+     * exatamente UMA é faturada, nunca duas.
+     *   • 'produto_ausente' — a fonte não tem nenhuma linha deste produto no pedido
+     *   • 'linha_excedente' — a fonte ainda tem irmãs, mas menos do que o DB tem em aberto
+     * @param {Array} row linha do Relatorio_DB
+     * @param {Map} orcamento mapa de excedente a consumir (cópia descartável na pré-contagem)
      */
-    const _motivoSaidaDaFonte_ = (row) => {
-      if (fonteIdentLoose.size === 0) return null; // sem índice confiável → nunca decide
-      const ch = _chavesIdentidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[10], row[11]);
-      if (!ch.loose.replace(/\|/g, '')) return null; // linha sem identificadores
-      const naFonteLoose = fonteIdentLoose.get(ch.loose) || 0;
-      if (naFonteLoose === 0) return 'produto_ausente';
-      const naFonteTight = fonteIdentTight.get(ch.tight) || 0;
-      const abertasDb    = dbAtivosIdentLoose.get(ch.loose) || 0;
-      if (naFonteTight === 0 && abertasDb > naFonteLoose) return 'linha_excedente';
-      return null;
+    const _motivoSaidaDaFonte_ = (row, orcamento) => {
+      if (fonteIdent.size === 0) return null; // sem índice confiável → nunca decide
+      const ident = _identidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL]);
+      if (!ident) return null;                // linha sem identificadores
+      const restante = orcamento.get(ident) || 0;
+      if (restante <= 0) return null;         // grupo já equilibrado com a fonte → não mexe
+      orcamento.set(ident, restante - 1);
+      return (fonteIdent.get(ident) || 0) === 0 ? 'produto_ausente' : 'linha_excedente';
     };
 
     // VÁLVULAS DE SEGURANÇA — faturar é irreversível pelo sync (uma linha Faturado que volta a
@@ -3025,11 +3009,12 @@ function sincronizarDados() {
     //      faturamento em um ciclo; já uma importação truncada que se recupera na rodada
     //      seguinte nunca chega a faturar nada.
     let totalAbertos = 0, totalSemFonte = 0;
+    const orcamentoPrevia = new Map(excedentePorIdent); // cópia: a pré-contagem não pode gastar o orçamento real
     for (const [, dbi] of dbMap.entries()) {
       const s3 = String(dbi.row[STATUS_COL] || '').trim();
       if (s3 === 'Faturado' || s3 === 'Finalizado' || s3 === 'Excluido') continue;
       totalAbertos++;
-      if (_motivoSaidaDaFonte_(dbi.row)) totalSemFonte++;
+      if (_motivoSaidaDaFonte_(dbi.row, orcamentoPrevia)) totalSemFonte++;
     }
     const fracaoSemFonte = totalAbertos > 0 ? (totalSemFonte / totalAbertos) : 0;
 
@@ -3038,7 +3023,7 @@ function sincronizarDados() {
     const quedaBrusca    = totalAnterior > 0 && fonteLinhasLidas < totalAnterior * (1 - TOLERANCIA_QUEDA_FONTE);
     if (fonteLinhasLidas > 0) propsFonte.setProperty('ULTIMO_TOTAL_FONTE', String(fonteLinhasLidas));
 
-    const autoFaturarSaidaFonte = (fonteIdentLoose.size > 0)
+    const autoFaturarSaidaFonte = (fonteIdent.size > 0)
       && (fonteLinhasLidas >= MIN_LINHAS_FONTE_PARA_FATURAR)
       && (fracaoSemFonte <= MAX_FRACAO_SEM_FONTE)
       && !quedaBrusca;
@@ -3500,7 +3485,7 @@ function sincronizarDados() {
           // e o Set ficava sempre vazio, tornando a distinção inoperante.
           const marcarFaturarUsuario = String(dbItem.row[MARCAR_FATURAR_USUARIO_COL] || '').trim();
           const marcadoPeloUsuario = aguardandoNF && marcarFaturarUsuario !== '';
-          const motivoSaida = _motivoSaidaDaFonte_(dbItem.row);
+          const motivoSaida = _motivoSaidaDaFonte_(dbItem.row, excedentePorIdent);
           if (marcadoPeloUsuario) {
             // MARCAR_FATURAR=SIM posto pelo USUÁRIO (col V preenchida) → saída esperada → Faturado direto
             Logger.log(`   ✋→✅ Marcado pelo usuário (${marcarFaturarUsuario}) + saiu do PEDIDOS → Faturado direto (QTD=${qtdAberta}, ID="${id}")`);
@@ -5593,19 +5578,16 @@ function faturarItensForaDaFonte() {
     }
 
     // 1) Identidades presentes em DADOS_IMPORTADOS
-    const fonteIdentTight = new Map();
-    const fonteIdentLoose = new Map();
+    const fonteIdent = new Map();
     let fonteLinhas = 0;
     const impSheet = ss.getSheetByName(IMPORTRANGE_SHEET_NAME);
     if (impSheet && impSheet.getLastRow() >= FONTE_DATA_START_ROW) {
-      impSheet.getRange(FONTE_DATA_START_ROW, 1, impSheet.getLastRow() - FONTE_DATA_START_ROW + 1, 14)
+      impSheet.getRange(FONTE_DATA_START_ROW, 1, impSheet.getLastRow() - FONTE_DATA_START_ROW + 1, 13)
         .getDisplayValues().forEach(l => {
           if (!String(l[1] || '').trim()) return; // sem CARTELA
           fonteLinhas++;
-          const ch = _chavesIdentidadeItem_(l[2], l[4], l[6], l[8], l[12], l[13]);
-          if (!ch.loose.replace(/\|/g, '')) return;
-          fonteIdentTight.set(ch.tight, (fonteIdentTight.get(ch.tight) || 0) + 1);
-          fonteIdentLoose.set(ch.loose, (fonteIdentLoose.get(ch.loose) || 0) + 1);
+          const ident = _identidadeItem_(l[2], l[4], l[6], l[8]);
+          if (ident) fonteIdent.set(ident, (fonteIdent.get(ident) || 0) + 1);
         });
     }
     if (fonteLinhas < MIN_LINHAS_FONTE_PARA_FATURAR) {
@@ -5637,8 +5619,16 @@ function faturarItensForaDaFonte() {
       if (!String(row[ID_COL] || '').trim()) return;
       const st = String(row[STATUS_COL] || '').trim();
       if (st === 'Faturado' || st === 'Finalizado' || st === 'Excluido') return;
-      const ch = _chavesIdentidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[10], row[11]);
-      abertasPorIdent.set(ch.loose, (abertasPorIdent.get(ch.loose) || 0) + 1);
+      const ident = _identidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL]);
+      if (ident) abertasPorIdent.set(ident, (abertasPorIdent.get(ident) || 0) + 1);
+    });
+
+    // Mesmo orçamento de excedente usado pelo sync: o DB deve ter tantas linhas em aberto
+    // quantas a fonte tem; o que passa disso e não é referenciado por PEDIDOS é o passivo.
+    const orcamento = new Map();
+    abertasPorIdent.forEach((abertas, ident) => {
+      const naFonte = fonteIdent.get(ident) || 0;
+      if (abertas > naFonte) orcamento.set(ident, abertas - naFonte);
     });
 
     const selecionadas = []; // {linha, id, motivo, row}
@@ -5653,16 +5643,13 @@ function faturarItensForaDaFonte() {
       const uuid = String(row[DB_CODIGO_FIXO_COL] || '').trim();
       if (peIds.has(id) || (uuid && peUuids.has(uuid))) return; // PEDIDOS ainda referencia
 
-      const ch = _chavesIdentidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[10], row[11]);
-      if (!ch.loose.replace(/\|/g, '')) return;
-      const naFonteLoose = fonteIdentLoose.get(ch.loose) || 0;
-      let motivo = null;
-      if (naFonteLoose === 0) {
-        motivo = 'produto_ausente';
-      } else if ((fonteIdentTight.get(ch.tight) || 0) === 0 && (abertasPorIdent.get(ch.loose) || 0) > naFonteLoose) {
-        motivo = 'linha_excedente';
-      }
-      if (motivo) selecionadas.push({ linha: i + 2, id: id, motivo: motivo, row: row });
+      const ident = _identidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL]);
+      if (!ident) return;
+      const restante = orcamento.get(ident) || 0;
+      if (restante <= 0) return; // grupo já equilibrado com a fonte
+      orcamento.set(ident, restante - 1);
+      const motivo = (fonteIdent.get(ident) || 0) === 0 ? 'produto_ausente' : 'linha_excedente';
+      selecionadas.push({ linha: i + 2, id: id, motivo: motivo, row: row });
     });
 
     if (selecionadas.length === 0) {
@@ -5805,36 +5792,39 @@ function _verificarIntegridadeDuplicatas_() {
 
     // Índice de identidade de DADOS_IMPORTADOS (CLIENTE|PEDIDO|MARFIM|TAMANHO) — a verificação
     // 5 pergunta "a origem ainda conhece este item?" sem depender de ter um irmão no grupo.
-    const fonteIdent = new Set();
+    const fonteIdent = new Map(); // identidade → nº de linhas na fonte
     try {
       const impSheet = getSpreadsheet_().getSheetByName(IMPORTRANGE_SHEET_NAME);
       if (impSheet && impSheet.getLastRow() >= FONTE_DATA_START_ROW) {
-        impSheet.getRange(FONTE_DATA_START_ROW, 1, impSheet.getLastRow() - FONTE_DATA_START_ROW + 1, 14)
+        impSheet.getRange(FONTE_DATA_START_ROW, 1, impSheet.getLastRow() - FONTE_DATA_START_ROW + 1, 13)
           .getDisplayValues().forEach(l => {
             if (!String(l[1] || '').trim()) return; // sem CARTELA
-            fonteIdent.add(_chavesIdentidadeItem_(l[2], l[4], l[6], l[8], l[12], l[13]).loose);
+            const ident = _identidadeItem_(l[2], l[4], l[6], l[8]);
+            if (ident) fonteIdent.set(ident, (fonteIdent.get(ident) || 0) + 1);
           });
       }
     } catch (ei) {
       Logger.log(`   ⚠️ Sentinela: DADOS_IMPORTADOS ilegível (${ei.message}) — verificação 5 desabilitada`);
     }
 
-    // 5) linha em aberto que sumiu de PEDIDOS *e* de DADOS_IMPORTADOS — o item saiu do sistema
-    // de origem e continua ocupando o card da OC. A verificação 4 não a enxerga quando o grupo
-    // de identidade não tem nenhum irmão reconhecido pela fonte, que é exatamente o caso de uma
-    // OC faturada por inteiro (na Bahia, 64 OCs inteiras nessa situação).
+    // 5) linhas em aberto além do que a fonte reconhece. Mede o mesmo excedente por identidade
+    // que o sync usa para faturar: o DB deve ter tantas linhas em aberto quantas a fonte tem.
+    // A verificação 4 não enxerga esse caso quando o grupo não tem irmão reconhecido pela fonte
+    // (OC faturada por inteiro — na Bahia eram 64 OCs assim) nem quando as irmãs são cópias
+    // perfeitas, como acontece em mm.
     let orfasSemFonte = 0;
     if (fonteIdent.size > 0) {
+      const abertasPorIdent = new Map();
       dados.forEach(row => {
-        const id = String(row[ID_COL] || '').trim();
-        if (!id) return;
+        if (!String(row[ID_COL] || '').trim()) return;
         const st = String(row[STATUS_COL] || '').trim();
         if (st === 'Faturado' || st === 'Finalizado' || st === 'Excluido') return;
-        const uuid = String(row[DB_CODIGO_FIXO_COL] || '').trim();
-        if (peIds.has(id) || (uuid && peUuids.has(uuid))) return;
-        const ch = _chavesIdentidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[10], row[11]);
-        if (!ch.loose.replace(/\|/g, '')) return;
-        if (!fonteIdent.has(ch.loose)) orfasSemFonte++;
+        const ident = _identidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL]);
+        if (ident) abertasPorIdent.set(ident, (abertasPorIdent.get(ident) || 0) + 1);
+      });
+      abertasPorIdent.forEach((abertas, ident) => {
+        const naFonte = fonteIdent.get(ident) || 0;
+        if (abertas > naFonte) orfasSemFonte += abertas - naFonte;
       });
     }
 
