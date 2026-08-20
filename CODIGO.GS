@@ -2986,6 +2986,12 @@ function sincronizarDados() {
      * exatamente UMA é faturada, nunca duas.
      *   • 'produto_ausente' — a fonte não tem nenhuma linha deste produto no pedido
      *   • 'linha_excedente' — a fonte ainda tem irmãs, mas menos do que o DB tem em aberto
+     *
+     * O orçamento é medido ANTES das inserções desta rodada. Um item novo que entra com a mesma
+     * identidade pode, por isso, deixar uma linha a mais por UM ciclo; a rodada seguinte
+     * recalcula sobre o estado já atualizado e resolve. O invariante vale no estado estável,
+     * não a cada instante — e é assim de propósito: medir depois das inserções faria a linha
+     * nova "pagar" pela antiga na mesma rodada, faturando um item que ainda está na fonte.
      * @param {Array} row linha do Relatorio_DB
      * @param {Map} orcamento mapa de excedente a consumir (cópia descartável na pré-contagem)
      */
