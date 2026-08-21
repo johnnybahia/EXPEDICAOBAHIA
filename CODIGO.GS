@@ -99,7 +99,22 @@ const ORIG_SEQ_KEY_COLS  = [2, 3, 4, 5, 6, 7, 8, 9, 10, 13];
 const FONTE_SEQ_KEY_COLS = [3, 4, 5, 6, 7, 8, 9, 11, 12, 10];
 // Apenas itens com DATA RECEB. (data de entrada) a partir desta data recebem sequência
 const SEQUENCIA_DATA_CORTE = new Date(2026, 5, 11); // 11/06/2026
-const DIAS_RETENCAO = 15;      // Itens com status final são purgados após este número de dias
+const DIAS_RETENCAO = 1;       // Idade mínima (dias) para um item Faturado ser purgado.
+// A purga roda em um HORÁRIO FIXO, uma vez por dia — não a toda hora com prazo individual
+// por item. Motivo: o sistema usa etiquetas físicas nos itens; um funcionário precisa de um
+// horário-limite ÚNICO e memorizável ("resolve até as 11h") para saber quando um item some do
+// sistema, não um prazo que varia item a item conforme o minuto exato em que cada um faturou.
+// O horário é definido pelo próprio usuário na aba CONFIGURAÇÕES (célula B2) — ver
+// _getHoraLimpezaFaturados_. DIAS_RETENCAO continua como piso de segurança: um item só é
+// elegível na primeira passada do horário configurado que vier pelo menos este número de dias
+// depois de ter virado Faturado — garante que nada seja purgado com poucos minutos de aviso.
+// Feita por purgarItensFinalizados(), chamada pela Etapa 3 de processoAutomaticoCompleto só
+// quando _deveLimparFaturadosAgora_() autoriza. Nunca toca em item Ativo, nunca troca ID de
+// ninguém — diferente do RESET COMPLETO (resetarEReprocessar/resetarEReprocessarSilencioso),
+// que apaga e regenera a identidade de TODOS os itens, inclusive os ainda em aberto.
+const CONFIG_SHEET_NAME = 'CONFIGURAÇÕES'; // aba onde o usuário ajusta configurações do sistema
+const CONFIG_HORA_LIMPEZA_CELL = 'B2';     // hora (0-23, fuso de Fortaleza) da limpeza diária de Faturados
+const CONFIG_HORA_LIMPEZA_PADRAO = 11;     // usado se a célula estiver vazia/inválida
 
 // ====== TRAVAS DO AUTO-FATURAMENTO POR SAÍDA DA FONTE ======
 // Um item que some de PEDIDOS e de DADOS_IMPORTADOS saiu do sistema de origem e deve virar
@@ -930,6 +945,8 @@ function onOpen() {
     .addItem('📤 Faturar itens que já saíram da origem (Ativo sem fonte)', 'faturarItensForaDaFonte')
     .addSeparator()
     .addItem('🚑 REPARAR duplicatas de importação parcial (CLIENTE vazio)', 'repararLinhasDeImportacaoParcial')
+    .addSeparator()
+    .addItem('🧹 Limpar Faturados agora (ignora horário configurado)', 'limparFaturadosAgoraMenu')
     .addSeparator()
     .addItem('🛡️ Verificar duplicidade agora (sentinela)', 'verificarDuplicidadeAgora')
     .addItem('🔎 Diagnosticar itens duplicados em 2 OCs', 'diagnosticarItensDuplicadosOC')
@@ -2392,15 +2409,23 @@ function processoAutomaticoCompleto() {
       Logger.log(`   ✓ Nenhuma mudança - dados já sincronizados`);
     }
 
-    // ETAPA 3: Purgar itens finalizados com mais de DIAS_RETENCAO dias
-    Logger.log(`\n🗑️ ETAPA 3: Purga de itens finalizados (>${DIAS_RETENCAO} dias)`);
+    // ETAPA 3: Purgar itens finalizados — uma vez por dia, no horário configurado
+    // pelo usuário (aba CONFIGURAÇÕES), não a toda hora com prazo individual por item.
+    // Ver _deveLimparFaturadosAgora_ para o motivo: horário fixo e memorizável para
+    // quem precisa remover a etiqueta física do item antes dele sumir do sistema.
+    Logger.log(`\n🗑️ ETAPA 3: Purga de itens finalizados (Faturado há ≥${DIAS_RETENCAO} dia(s))`);
     try {
-      const resultadoPurga = purgarItensFinalizados();
-      if (resultadoPurga.purgados > 0) {
-        Logger.log(`   ✅ ${resultadoPurga.purgados} item(ns) purgado(s) do DB`);
-        houveMudancas = true;
+      if (!_deveLimparFaturadosAgora_()) {
+        Logger.log(`   ⏭️ Fora do horário configurado (ou já rodou hoje) — purga adiada`);
       } else {
-        Logger.log(`   ✓ Nenhum item para purgar`);
+        const resultadoPurga = purgarItensFinalizados();
+        _registrarLimpezaFaturadosFeitaHoje_();
+        if (resultadoPurga.purgados > 0) {
+          Logger.log(`   ✅ ${resultadoPurga.purgados} item(ns) purgado(s) do DB`);
+          houveMudancas = true;
+        } else {
+          Logger.log(`   ✓ Nenhum item para purgar`);
+        }
       }
     } catch (ePurga) {
       Logger.log(`   ⚠️ Erro na purga (não crítico): ${ePurga.message}`);
@@ -4353,6 +4378,98 @@ function _removerAlertasDoItem_(id) {
  * Chamada automaticamente pelo processoAutomaticoCompleto().
  * Pode também ser executada manualmente pelo editor (sem UI).
  */
+/**
+ * Garante que a aba CONFIGURAÇÕES existe, com o rótulo e o valor padrão na célula da hora
+ * de limpeza — só na criação; nunca sobrescreve um valor que o usuário já tenha ajustado.
+ * @returns {Sheet}
+ */
+function _garantirAbaConfiguracoes_() {
+  let sheet = getSpreadsheet_().getSheetByName(CONFIG_SHEET_NAME);
+  if (sheet) return sheet;
+
+  Logger.log(`📝 Criando aba ${CONFIG_SHEET_NAME}...`);
+  sheet = getSpreadsheet_().insertSheet(CONFIG_SHEET_NAME);
+  sheet.getRange('A1').setValue('CONFIGURAÇÕES DO SISTEMA').setFontWeight('bold').setFontSize(12);
+  sheet.getRange('A2').setValue('Horário da limpeza de itens Faturados (0 a 23, horário de Fortaleza):');
+  sheet.getRange(CONFIG_HORA_LIMPEZA_CELL).setValue(CONFIG_HORA_LIMPEZA_PADRAO).setFontWeight('bold');
+  sheet.getRange('A3').setValue(
+    'Todo dia, na primeira sincronização a partir desse horário, os itens Faturado/Finalizado/' +
+    'Excluído com pelo menos ' + DIAS_RETENCAO + ' dia(s) somem do relatório. Para mudar, edite ' +
+    'só o número da célula ' + CONFIG_HORA_LIMPEZA_CELL + ' — vale a partir da próxima sincronização.'
+  ).setFontStyle('italic').setFontColor('#666666');
+  sheet.autoResizeColumn(1);
+  SpreadsheetApp.flush();
+  Logger.log(`✅ Aba ${CONFIG_SHEET_NAME} criada com horário padrão ${CONFIG_HORA_LIMPEZA_PADRAO}h`);
+  return sheet;
+}
+
+/**
+ * Lê o horário (0-23) configurado pelo usuário para a limpeza diária de Faturados.
+ * Cria a aba CONFIGURAÇÕES com o padrão se ela não existir. Valor ausente ou fora de
+ * 0-23 cai no padrão — nunca lança erro, a limpeza não pode travar por causa disto.
+ * @returns {number} hora 0-23
+ */
+function _getHoraLimpezaFaturados_() {
+  try {
+    const sheet = _garantirAbaConfiguracoes_();
+    const val = sheet.getRange(CONFIG_HORA_LIMPEZA_CELL).getValue();
+    const n = Number(val);
+    if (isFinite(n) && n >= 0 && n <= 23) return Math.floor(n);
+    Logger.log(`   ⚠️ CONFIGURAÇÕES!${CONFIG_HORA_LIMPEZA_CELL}="${val}" inválido — usando padrão ${CONFIG_HORA_LIMPEZA_PADRAO}h`);
+    return CONFIG_HORA_LIMPEZA_PADRAO;
+  } catch (e) {
+    Logger.log(`   ⚠️ _getHoraLimpezaFaturados_: ${e.message} — usando padrão ${CONFIG_HORA_LIMPEZA_PADRAO}h`);
+    return CONFIG_HORA_LIMPEZA_PADRAO;
+  }
+}
+
+/**
+ * Decide se a limpeza diária de Faturados deve rodar AGORA.
+ *
+ * Só autoriza uma vez por dia: na primeira execução cuja hora local (fuso de Fortaleza)
+ * seja igual ou depois do horário configurado. Usa uma propriedade do script (não uma
+ * hora exata) para não depender de cair bem na hora certa — se o trigger horário atrasar
+ * ou for adiado por lock, ainda assim libera na primeira passada seguinte.
+ * @returns {boolean}
+ */
+function _deveLimparFaturadosAgora_() {
+  const horaLimpeza = _getHoraLimpezaFaturados_();
+  const agora = new Date();
+  const horaAtual = Number(Utilities.formatDate(agora, TZ, 'H'));
+  const hojeStr = Utilities.formatDate(agora, TZ, 'yyyy-MM-dd');
+
+  if (horaAtual < horaLimpeza) return false; // ainda não chegou o horário de hoje
+
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('ULTIMA_LIMPEZA_FATURADOS_DATA') === hojeStr) return false; // já rodou hoje
+
+  return true;
+}
+
+/** Marca que a limpeza diária de Faturados já rodou hoje (fuso de Fortaleza). */
+function _registrarLimpezaFaturadosFeitaHoje_() {
+  const hojeStr = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+  PropertiesService.getScriptProperties().setProperty('ULTIMA_LIMPEZA_FATURADOS_DATA', hojeStr);
+}
+
+/**
+ * Roda a limpeza de Faturados agora, ignorando o horário configurado em CONFIGURAÇÕES —
+ * para testar a configuração nova ou forçar uma limpeza fora do horário de rotina.
+ * Não mexe no registro de "já rodou hoje": a rotina automática no horário configurado
+ * continua valendo normalmente depois desta chamada manual.
+ */
+function limparFaturadosAgoraMenu() {
+  const ui = SpreadsheetApp.getUi();
+  const resultado = purgarItensFinalizados();
+  if (resultado.purgados > 0) limparCache();
+  ui.alert(
+    '✅ Limpeza concluída',
+    `${resultado.purgados} item(ns) Faturado/Finalizado/Excluído com ≥${DIAS_RETENCAO} dia(s) removido(s).\n\n` +
+    `O horário automático configurado em "${CONFIG_SHEET_NAME}" continua rodando normalmente — isto foi só um empurrão manual.`,
+    ui.ButtonSet.OK
+  );
+}
+
 function purgarItensFinalizados() {
   const STATUS_FINAIS = new Set(['Faturado', 'Finalizado', 'Excluido']);
   const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
