@@ -1630,6 +1630,14 @@
         };
     }
 
+    // INFO_Y (coluna Y da fonte) vem como "NORMAL" para pedidos comuns (sem conta e ordem) e só
+    // carrega informação útil quando marca uma transferência ("CONTA E ORDEM X Y"). "NORMAL" não
+    // deve aparecer colado à marca nos cards — filtra antes de concatenar.
+    function _infoYExibivel_(v) {
+        const t = String(v || '').trim();
+        return /^normal$/i.test(t) ? '' : t;
+    }
+
     // ===== COMPATIBILIZAÇÃO v15.5 (normalização de chaves sem mudar funcionalidades) =====
     function normalizeItemKeys(i) {
       return {
@@ -2254,7 +2262,7 @@ ALL_OCS_ITEMS = itemsObj;
 
         const dateGroupLabel = ocInfo.dateGroup ? ` <span style="font-size:0.8em;font-weight:400;color:#64748b;">· 📅 Entrega: ${ocInfo.dateGroup}</span>` : '';
         // Marca (coluna X) + informação da coluna Y, coladas e sem rótulo
-        const _marcaCard = [ocInfo.infoX, ocInfo.infoY].map(v => String(v || '').trim()).filter(Boolean).join(' · ');
+        const _marcaCard = [String(ocInfo.infoX || '').trim(), _infoYExibivel_(ocInfo.infoY)].filter(Boolean).join(' · ');
         let headerHtml = `
             <div class="card-header">
                 ${statusPrazo ? `<span class="prazo-badge ${statusPrazo}">${textoPrazo}</span>` : ''}
@@ -4582,7 +4590,7 @@ ALL_OCS_ITEMS = itemsObj;
 
             const marcas = [...new Set(itens.map(i => i.INFO_X || '').filter(Boolean))].join(', ');
             // Informação da coluna Y (alinhada à OC), colada na marca sem rótulo
-            const infoYs = [...new Set(itens.map(i => i.INFO_Y || '').filter(Boolean))].join(', ');
+            const infoYs = [...new Set(itens.map(i => _infoYExibivel_(i.INFO_Y)).filter(Boolean))].join(', ');
             const marcaComY = [marcas, infoYs].filter(Boolean).join(' · ');
             const marcaBadgeHtml = marcaComY
                 ? `<span class="marca-badge">${marcaComY.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</span>`
@@ -4843,7 +4851,7 @@ ALL_OCS_ITEMS = itemsObj;
             const marcaCliente = _chaveAgrupamentoFatur(itens[0] || {});
             const marcaLabel = marcaCliente && marcaCliente !== '(Sem Referência)' ? marcaCliente : '';
             // Marca (coluna X) + informação da coluna Y, coladas e sem rótulo
-            const _infoYProd = itens[0] && itens[0].INFO_Y ? String(itens[0].INFO_Y).trim() : '';
+            const _infoYProd = itens[0] ? _infoYExibivel_(itens[0].INFO_Y) : '';
             const marcaLabelFull = [marcaLabel, _infoYProd].filter(Boolean).join(' · ');
 
             html += `
@@ -5585,7 +5593,7 @@ ALL_OCS_ITEMS = itemsObj;
                 );
                 // Marca (coluna X) + informação da coluna Y, coladas ao lado do cliente e sem rótulo
                 const _marcaBaseFat = ocData.marca && ocData.marca !== ocData.cliente ? ocData.marca : '';
-                const _marcaFullFat = [_marcaBaseFat, ocData.infoY].filter(Boolean).join(' · ');
+                const _marcaFullFat = [_marcaBaseFat, _infoYExibivel_(ocData.infoY)].filter(Boolean).join(' · ');
                 const marcaOc = _marcaFullFat ? ` - ${_marcaFullFat}` : '';
 
                 html += `
