@@ -99,7 +99,13 @@ const ORIG_SEQ_KEY_COLS  = [2, 3, 4, 5, 6, 7, 8, 9, 10, 13];
 const FONTE_SEQ_KEY_COLS = [3, 4, 5, 6, 7, 8, 9, 11, 12, 10];
 // Apenas itens com DATA RECEB. (data de entrada) a partir desta data recebem sequência
 const SEQUENCIA_DATA_CORTE = new Date(2026, 5, 11); // 11/06/2026
-const DIAS_RETENCAO = 15;      // Itens com status final são purgados após este número de dias
+const DIAS_RETENCAO = 1;       // Itens com status final são purgados após este número de dias.
+// Purga é feita por purgarItensFinalizados(), chamada automaticamente TODA HORA pela
+// Etapa 3 de processoAutomaticoCompleto — só remove linhas já Faturado/Finalizado/Excluido
+// com DATA_STATUS mais velha que este prazo. Nunca toca em item Ativo, nunca troca ID de
+// ninguém. É a ferramenta certa para "limpar o histórico faturado depois de um tempo" —
+// diferente do RESET COMPLETO (resetarEReprocessar/resetarEReprocessarSilencioso), que apaga
+// e regenera a identidade de TODOS os itens, inclusive os ainda em aberto.
 
 // ====== TRAVAS DO AUTO-FATURAMENTO POR SAÍDA DA FONTE ======
 // Um item que some de PEDIDOS e de DADOS_IMPORTADOS saiu do sistema de origem e deve virar
