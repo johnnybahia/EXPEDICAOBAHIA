@@ -4201,27 +4201,21 @@ ALL_OCS_ITEMS = itemsObj;
             const ocData = ALL_OCS_ITEMS[oc.ordCompra];
             if (!ocData || !ocData.items) return;
 
-            // Filtrar por Marfim (CM/MM estão na coluna TAMANHO)
-            let itensFiltrados = ocData.items;
+            // Faturados não entram no relatório; filtrar por Marfim (CM/MM estão na coluna TAMANHO)
+            let itensFiltrados = ocData.items.filter(item => item.Status?.toLowerCase() !== 'faturado');
             if (marfimFilter === 'cm') {
-                itensFiltrados = ocData.items.filter(item => item.TAMANHO && item.TAMANHO.toUpperCase().includes('CM'));
+                itensFiltrados = itensFiltrados.filter(item => item.TAMANHO && item.TAMANHO.toUpperCase().includes('CM'));
             } else if (marfimFilter === 'mm') {
-                itensFiltrados = ocData.items.filter(item => item.TAMANHO && item.TAMANHO.toUpperCase().includes('MM'));
+                itensFiltrados = itensFiltrados.filter(item => item.TAMANHO && item.TAMANHO.toUpperCase().includes('MM'));
             }
 
             if (itensFiltrados.length === 0) return;
 
-            // Verificar se tem itens inativos ou faturados
-            const temInativos = ocData.items.some(item => item.Status?.toLowerCase() === 'inativo');
-            const temFaturados = ocData.items.some(item => item.Status?.toLowerCase() === 'faturado');
+            const temInativos = itensFiltrados.some(item => item.Status?.toLowerCase() === 'inativo');
 
             let avisos = '';
             let estilo = '';
 
-            if (temFaturados) {
-                avisos += ' <span style="color: #dc2626; font-weight: 600;">⚠️ Tem Faturados</span>';
-                estilo = 'background: #fef2f2; border-left: 4px solid #dc2626;';
-            }
             if (temInativos) {
                 avisos += ' <span style="color: #ea580c; font-weight: 600;">⚠️ Tem Inativos</span>';
             }
@@ -4726,7 +4720,6 @@ ALL_OCS_ITEMS = itemsObj;
                 }
                 .oc-section { page-break-inside: avoid; margin-bottom: 20px; }
                 .oc-header { background: #f3f4f6; padding: 8px; border: 2px solid #d1d5db; margin-bottom: 8px; }
-                .oc-header.faturado-pending { background: #fef2f2; border-color: #dc2626; }
                 .oc-title { font-size: 15px; font-weight: bold; margin-bottom: 4px; }
                 .oc-marca { font-size: 12px; font-weight: 700; color: #1e40af; background: #dbeafe; border-radius: 4px; padding: 1px 8px; margin-left: 6px; vertical-align: middle; }
                 .oc-avisos { color: #dc2626; font-weight: bold; font-size: 12px; }
@@ -4776,13 +4769,15 @@ ALL_OCS_ITEMS = itemsObj;
             if (!ocData || !ocData.items) return;
 
             const ocInfo = ALL_OCS_INFO.find(oc => oc.ordCompra === ocNum);
-            const items = ocData.items.filter(i => i.Status?.toLowerCase() !== 'excluido');
+            const items = ocData.items.filter(i => {
+                const st = i.Status?.toLowerCase();
+                return st !== 'excluido' && st !== 'faturado';
+            });
 
             if (items.length === 0) return;
 
             // Calcular metadados (mesma lógica dos cards)
             const hasInativos = items.some(i => i.Status?.toLowerCase() === 'inativo');
-            const hasFaturados = items.some(i => i.Status?.toLowerCase() === 'faturado');
             const prazoMin = calcularPrazoMinimo(items);
             const prazoKey = (prazoMin === null || isNaN(prazoMin)) ? Infinity : prazoMin;
             // Ordena itens internos (DASS/Dilly: agrupa por OS; demais: por posicaoFonte)
@@ -4841,11 +4836,9 @@ ALL_OCS_ITEMS = itemsObj;
             }
 
             // Verificar avisos
-            const temInativos = ocData.items.some(item => item.Status?.toLowerCase() === 'inativo');
-            const temFaturados = ocData.items.some(item => item.Status?.toLowerCase() === 'faturado');
+            const temInativos = itens.some(item => item.Status?.toLowerCase() === 'inativo');
 
             let avisos = [];
-            if (temFaturados) avisos.push('⚠️ Contém itens Faturados');
             if (temInativos) avisos.push('⚠️ Contém itens Inativos');
 
             const marcaCliente = _chaveAgrupamentoFatur(itens[0] || {});
@@ -4856,7 +4849,7 @@ ALL_OCS_ITEMS = itemsObj;
 
             html += `
                 <div class="oc-section">
-                    <div class="oc-header ${temFaturados ? 'faturado-pending' : ''}">
+                    <div class="oc-header">
                         <div class="oc-title">OC: ${ocNum} - ${nomeCliente}${marcaLabelFull ? ` <span class="oc-marca">📋 ${marcaLabelFull}</span>` : ''}</div>
                         ${avisos.length > 0 ? `<div class="oc-avisos">${avisos.join(' | ')}</div>` : ''}
                     </div>
