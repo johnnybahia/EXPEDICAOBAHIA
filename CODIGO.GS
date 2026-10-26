@@ -17,7 +17,22 @@ const IMPORTRANGE_SHEET_NAME = "DADOS_IMPORTADOS"; // Nova aba intermediária
 const DB_SHEET_NAME = "Relatorio_DB";
 const FONTE_DATA_START_ROW = 4;
 const TZ = 'America/Fortaleza';
-const APP_VERSION = '15.6-SINCRONIZACAO';
+const APP_VERSION = '15.7-SINCRONIZACAO';
+
+// Utilities.formatDate é uma chamada de serviço do Apps Script (~ms cada). Chamada por linha em
+// cada impressão digital, ela somava minutos por sincronização (ETAPA 0 levou 306 s em 26/10/2026
+// com 2452 linhas e a execução estourou os 360 s). As datas distintas são poucas (dezenas), então
+// o resultado é memoizado por (padrão, instante). O cache vive só na execução atual.
+const _FMT_DATA_CACHE_ = new Map();
+function _formatarDataRapido_(data, padrao) {
+  const chave = padrao + '|' + data.getTime();
+  let r = _FMT_DATA_CACHE_.get(chave);
+  if (r === undefined) {
+    r = Utilities.formatDate(data, TZ, padrao);
+    _FMT_DATA_CACHE_.set(chave, r);
+  }
+  return r;
+}
 
 // CACHE (10 minutos)
 const CACHE_DURATION = 600; // 10 minutos em segundos
@@ -67,6 +82,12 @@ const PEDIDOS_LOTE_COL          = 20; // U (coluna 21) — número de lote da co
 const DB_LOTE_COL               = 20; // U (coluna 21) — número de lote propagado do PEDIDOS para o Relatorio_DB
 const PEDIDOS_SEQ_ORIGINAL_COL  = 21; // V (coluna 22) — sequência do item dentro da OC conforme aba "original" (fixa, nunca recalculada)
 const DB_SEQUENCIA_COL          = 24; // Y (coluna 25) — sequência propagada do PEDIDOS para o Relatorio_DB (fixa)
+// AA (coluna 27) — conferência de item que saiu da origem SEM marcação de usuário (a col Z é INFO_Y).
+// "PENDENTE|sistema|data|motivo" = aguardando alguém responder o aviso na tela; "ABERTO|usuário|data|…" =
+// usuário disse que continua aberto; "FATURADO|…", "CANCELADO|…", "DUPLICATA|…" = registro da decisão.
+// REGRA: nenhum item vira Faturado sem usuário identificado — só pela marcação do usuário (col V
+// preenchida) ou pela confirmação de um usuário no aviso. O sync nunca fatura por inferência.
+const DB_CONFERENCIA_SAIDA_COL  = 26;
 const PEDIDOS_COLY_COL          = 22; // W (coluna 23) — campo da coluna Y da fonte (informação adicional da OC, exibida junto da marca)
 const DB_COLY_COL               = 25; // Z (coluna 26) — campo da coluna Y propagado do PEDIDOS para o Relatorio_DB
 const LOTE_DILLY_SHEET_NAME     = 'LOTE DILLY'; // aba com mapeamento OC→Lote para o cliente Dilly
@@ -137,6 +158,42 @@ const MAX_FRACAO_LINHAS_QUEBRADAS   = 0.02;
 const BAIXAS_SHEET_NAME = "Baixas_Historico";
 
 // ====== FUNÇÕES AUXILIARES SEGURAS ======
+/** Lê a coluna AA (CONFERENCIA_SAIDA) de uma linha do Relatorio_DB. null quando vazia. */
+function _lerConferencia_(row) {
+  const texto = String((row && row[DB_CONFERENCIA_SAIDA_COL]) || '').trim();
+  if (!texto) return null;
+  return { tipo: texto.split('|')[0].trim().toUpperCase(), texto: texto };
+}
+
+/** Cópia da linha completada com '' até ter pelo menos n colunas. */
+function _linhaComLargura_(row, n) {
+  const copia = [...row];
+  while (copia.length < n) copia.push('');
+  return copia;
+}
+
+/**
+ * Texto legível de quem marcou: a col V guarda JSON por perfil ({"BAIXA1":"ANA"}) ou, em dado
+ * legado, o nome puro. Devolve "ANA (BAIXA1)"; vazio quando ninguém marcou.
+ */
+function _usuarioDaMarcacao_(valor) {
+  const s = String(valor === null || valor === undefined ? '' : valor).trim();
+  if (!s || s.charAt(0) !== '{') return s;
+  try {
+    const o = JSON.parse(s);
+    const partes = Object.keys(o || {}).map(k => `${String(o[k]).trim()} (${k})`);
+    return partes.length ? partes.join(', ') : '';
+  } catch (e) {
+    return s;
+  }
+}
+
+/** Monta o texto da coluna AA: TIPO|quem|dd/MM/yyyy HH:mm|detalhe */
+function _textoConferencia_(tipo, quem, detalhe) {
+  const quando = Utilities.formatDate(new Date(), TZ, 'dd/MM/yyyy HH:mm');
+  return [tipo, String(quem || '').replace(/\|/g, '/'), quando, String(detalhe || '').replace(/\|/g, '/')].join('|');
+}
+
 /**
  * Converte um valor Date para ISO string de forma segura.
  * Retorna string vazia se a data for inválida.
@@ -193,13 +250,13 @@ function _asDate_(v) {
 function _fmtBR_(d) {
   if (!d) return '';
   const dt = _asDate_(d);
-  return dt ? Utilities.formatDate(dt, TZ, 'dd/MM/yyyy') : '';
+  return dt ? _formatarDataRapido_(dt, 'dd/MM/yyyy') : '';
 }
 
 function _fmtBRDateTime_(d) {
   if (!d) return '';
   const dt = _asDate_(d);
-  return dt ? Utilities.formatDate(dt, TZ, 'dd/MM/yyyy HH:mm') : '';
+  return dt ? _formatarDataRapido_(dt, 'dd/MM/yyyy HH:mm') : '';
 }
 
 function _toNumber_(v) {
@@ -933,16 +990,15 @@ function onOpen() {
   ui.createMenu('IDs Personalizados')
     .addItem('1. Gerar IDs Faltantes', 'gerarIDsUnicos')
     .addSeparator()
-    .addItem('2. Ativar Geração Automática (a cada 5 min)', 'instalarTriggerAutomatico')
+    .addItem('2. Ativar Geração Automática (importação 15 min, sync 1 h)', 'instalarTriggerAutomatico')
     .addItem('3. Desativar Geração Automática', 'desinstalarTriggerAutomatico')
     .addItem('4. Status do Trigger', 'mostrarStatusTrigger')
     .addSeparator()
     .addItem('⏸ Pausar sistema (para editar dados)', 'pausarSistema')
     .addItem('▶ Retomar sistema', 'retomarSistema')
     .addSeparator()
-    .addItem('🧹 Confirmar todos os alertas de faturamento (testes)', 'confirmarTodosAlertasMenu')
     .addItem('🔧 Corrigir Faturados com saldo aberto (reverter para Ativo)', 'corrigirFaturadosComSaldoAberto')
-    .addItem('📤 Faturar itens que já saíram da origem (Ativo sem fonte)', 'faturarItensForaDaFonte')
+    .addItem('📤 Sinalizar itens que já saíram da origem (aviso na tela)', 'faturarItensForaDaFonte')
     .addSeparator()
     .addItem('🚑 REPARAR duplicatas de importação parcial (CLIENTE vazio)', 'repararLinhasDeImportacaoParcial')
     .addSeparator()
@@ -1151,7 +1207,7 @@ function gerarIDsUnicos() {
     // Trata data de forma consistente (formata para yyyyMMdd se for Date)
     const dataReceb = linha[12]; // Coluna M - DATA RECEB.
     const dataFormatada = dataReceb instanceof Date ?
-      Utilities.formatDate(dataReceb, TZ, 'yyyyMMdd') :
+      _formatarDataRapido_(dataReceb, 'yyyyMMdd') :
       String(dataReceb || '').trim();
 
     // FIX: CARTELA (col B) e DESCRIÇÃO (col H) removidos do ID base.
@@ -1664,7 +1720,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
           const tam  = String(row[ORIG_TAM_COL]  || '').trim();
           const qtd  = String(row[ORIG_QTD_COL]  || '').trim();
           const data = row[ORIG_DATA_COL] instanceof Date
-            ? Utilities.formatDate(row[ORIG_DATA_COL], TZ, 'yyyy-MM-dd')
+            ? _formatarDataRapido_(row[ORIG_DATA_COL], 'yyyy-MM-dd')
             : String(row[ORIG_DATA_COL] || '').trim();
           const chave = `${oc}|${desc}|${tam}|${qtd}|${data}`;
           if (!originalPosMap.has(chave)) { // guarda apenas a primeira ocorrência
@@ -1885,7 +1941,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         // Gera ID usando lógica existente (concatenação + sufixo)
         const dataReceb = fonteRow[12]; // Coluna N em DADOS_IMPORTADOS = DATA RECEB. (índice 12)
         const dataFormatada = dataReceb instanceof Date ?
-          Utilities.formatDate(dataReceb, TZ, 'yyyyMMdd') :
+          _formatarDataRapido_(dataReceb, 'yyyyMMdd') :
           String(dataReceb || '').trim();
 
         // FIX: CARTELA (fonteRow[0]) e DESCRIÇÃO (fonteRow[6]) removidos do ID base.
@@ -1959,7 +2015,7 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         const tam  = String(fonteRow[7]  || '').trim(); // I: TAMANHO
         const qtd  = String(fonteRow[9]  || '').trim(); // K: QTD. ABERTA
         const data = fonteRow[12] instanceof Date
-          ? Utilities.formatDate(fonteRow[12], TZ, 'yyyy-MM-dd')
+          ? _formatarDataRapido_(fonteRow[12], 'yyyy-MM-dd')
           : String(fonteRow[12] || '').trim();          // N: DATA RECEB.
         const chave = `${oc}|${desc}|${tam}|${qtd}|${data}`;
         const posOriginal = originalPosMap.get(chave);
@@ -2206,7 +2262,7 @@ function _criarImpressaoDigitalFromRow_(row, offset) {
 // (240 ≡ "240" ≡ "240,00" ≡ "1.028,00"→"1028"); textos → trim + maiúsculas + espaços únicos.
 function _normSeqVal_(v) {
   if (v instanceof Date) {
-    return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
+    return isNaN(v.getTime()) ? '' : _formatarDataRapido_(v, 'yyyy-MM-dd');
   }
   if (typeof v === 'number') return isFinite(v) ? String(v) : '';
   let s = String(v === null || v === undefined ? '' : v).trim().toUpperCase().replace(/\s+/g, ' ');
@@ -2307,13 +2363,22 @@ function _agendarSincronizacao_(segundos) {
 // ─── TRIGGERS AUTOMÁTICOS ─────────────────────────────────────────────────────
 
 /**
- * IMPORTAÇÃO AUTOMÁTICA — Trigger recorrente (a cada 5 min)
+ * IMPORTAÇÃO AUTOMÁTICA — Trigger recorrente (a cada 15 min)
  * Responsável apenas por: planilha externa → DADOS_IMPORTADOS
  * Ao concluir, agenda processoAutomaticoCompleto para 90s depois (sequência garantida).
  */
 function processoImportacao() {
   if (_sistemaPausado_()) {
     Logger.log('⏸ Sistema pausado — importação ignorada.');
+    return;
+  }
+  // Mesma trava do processo completo: a importação apaga e regrava DADOS_IMPORTADOS inteira e
+  // não pode acontecer no meio de um sync (que lê essa aba duas vezes). Sem a trava, o sync podia
+  // ler a fonte pela metade e tratar linhas que só estavam sendo regravadas como "saíram da
+  // origem". Se o sync estiver rodando, esta rodada é pulada — a próxima vem no ciclo seguinte.
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    Logger.log('⏭️ Importação pulada — sincronização em andamento (trava ocupada).');
     return;
   }
   const inicio = Date.now();
@@ -2332,12 +2397,14 @@ function processoImportacao() {
     }
   } catch (e) {
     Logger.log(`❌ Erro em processoImportacao: ${e.message}`);
+  } finally {
+    lock.releaseLock();
   }
   Logger.log("=".repeat(70));
 }
 
 /**
- * PROCESSO AUTOMÁTICO DE SINCRONIZAÇÃO — Trigger separado (a cada 5 min)
+ * PROCESSO AUTOMÁTICO DE SINCRONIZAÇÃO — Trigger separado (a cada 1 h + 90 s após cada importação)
  * Responsável por: DADOS_IMPORTADOS → PEDIDOS → Relatorio_DB → purga → cache
  * Separado de processoImportacao para respeitar o limite de 6 minutos.
  *
@@ -2497,21 +2564,22 @@ function instalarTriggerAutomaticoSilencioso() {
       Logger.log(`✅ ${removidos} trigger(s) antigo(s) removido(s)`);
     }
 
-    // Trigger 1: importação da planilha externa → DADOS_IMPORTADOS
+    // Trigger 1: importação da planilha externa → DADOS_IMPORTADOS (15 min)
     ScriptApp.newTrigger('processoImportacao')
       .timeBased()
-      .everyMinutes(5)
+      .everyMinutes(15)
       .create();
 
-    // Trigger 2: sincronização DADOS_IMPORTADOS → PEDIDOS → DB
+    // Trigger 2: sincronização DADOS_IMPORTADOS → PEDIDOS → DB (1 h; cada importação
+    // bem-sucedida ainda agenda um sync 90 s depois)
     ScriptApp.newTrigger('processoAutomaticoCompleto')
       .timeBased()
-      .everyMinutes(5)
+      .everyHours(1)
       .create();
 
     Logger.log("✅ TRIGGERS INSTALADOS COM SUCESSO!");
-    Logger.log("   • processoImportacao       → a cada 5 min (importa dados externos)");
-    Logger.log("   • processoAutomaticoCompleto → a cada 5 min (sincroniza PEDIDOS → DB)");
+    Logger.log("   • processoImportacao       → a cada 15 min (importa dados externos)");
+    Logger.log("   • processoAutomaticoCompleto → a cada 1 h + 90 s após cada importação (sincroniza PEDIDOS → DB)");
 
     return { success: true };
 
@@ -2523,7 +2591,7 @@ function instalarTriggerAutomaticoSilencioso() {
 }
 
 /**
- * Instala o trigger automático que executa a cada 5 minutos
+ * Instala os triggers automáticos (importação a cada 15 min, sync a cada 1 h)
  * IMPORTANTE: Este trigger chama processoAutomaticoCompleto() que faz TUDO
  */
 function instalarTriggerAutomatico() {
@@ -2531,23 +2599,24 @@ function instalarTriggerAutomatico() {
     // Remove triggers antigos para evitar duplicatas
     desinstalarTriggerAutomatico();
 
-    // Trigger 1: importação da planilha externa → DADOS_IMPORTADOS (a cada 5 min)
+    // Trigger 1: importação da planilha externa → DADOS_IMPORTADOS (a cada 15 min)
     ScriptApp.newTrigger('processoImportacao')
       .timeBased()
-      .everyMinutes(5)
+      .everyMinutes(15)
       .create();
 
-    // Trigger 2: sincronização DADOS_IMPORTADOS → PEDIDOS → DB (a cada 5 min)
+    // Trigger 2: sincronização DADOS_IMPORTADOS → PEDIDOS → DB (a cada 1 h; cada importação
+    // bem-sucedida agenda mais um 90 s depois)
     ScriptApp.newTrigger('processoAutomaticoCompleto')
       .timeBased()
-      .everyMinutes(5)
+      .everyHours(1)
       .create();
 
     SpreadsheetApp.getUi().alert(
       '✅ Triggers Automáticos Ativados!',
-      'Dois triggers foram instalados (cada um a cada 5 minutos):\n\n' +
-      '• processoImportacao: importa dados da planilha externa\n' +
-      '• processoAutomaticoCompleto: sincroniza PEDIDOS → DB\n\n' +
+      'Dois triggers foram instalados:\n\n' +
+      '• processoImportacao (a cada 15 min): importa dados da planilha externa\n' +
+      '• processoAutomaticoCompleto (a cada 1 h + 90 s após cada importação): sincroniza PEDIDOS → DB\n\n' +
       'Para desativar, use o menu: IDs Personalizados > Desativar Geração Automática',
       SpreadsheetApp.getUi().ButtonSet.OK
     );
@@ -2638,7 +2707,7 @@ function mostrarStatusTrigger() {
         `Função: ${funcao}\n` +
         `Descrição: ${descricao}\n` +
         `Tipo: ${eventType}\n` +
-        `Frequência: A cada 5 minutos\n` +
+        `Frequência: importação a cada 15 min, sync a cada 1 h (+ 90 s após cada importação)\n` +
         `Triggers instalados: ${triggersAtivos.length}\n\n` +
         'O sistema automático está rodando:\n' +
         '• Gera IDs faltantes\n' +
@@ -2680,7 +2749,7 @@ function _gerarIdComposto_(row) {
 
   // Trata data especialmente
   const cleanM = colM instanceof Date ?
-    Utilities.formatDate(colM, TZ, 'yyyyMMdd') :
+    _formatarDataRapido_(colM, 'yyyyMMdd') :
     clean(String(colM || ''));
 
   // Concatena todas as colunas: C_D_E_F_G_J_L_M
@@ -2756,13 +2825,13 @@ function _normalizarData_(val) {
   // as lê de volta como objetos Date. Sem normalização, a fingerprint muda a cada sync.
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return '';
-    return Utilities.formatDate(val, TZ, 'yyyyMMdd');
+    return _formatarDataRapido_(val, 'yyyyMMdd');
   }
   if (typeof val === 'number' && val > 40000) {
     // Número serial do Sheets → converter para Date e formatar
     try {
       const d = new Date(Math.round((val - 25569) * 86400 * 1000));
-      return Utilities.formatDate(d, TZ, 'yyyyMMdd');
+      return _formatarDataRapido_(d, 'yyyyMMdd');
     } catch (e) { return String(val); }
   }
   return String(val || '').trim();
@@ -3000,6 +3069,9 @@ function sincronizarDados() {
     const dbSheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
     
     if (!fonteSheet || !dbSheet) { Logger.log("❌ Planilhas não encontradas"); return; }
+
+    // Garante cabeçalhos e colunas físicas do DB (inclui a AA, CONFERENCIA_SAIDA) antes de ler/gravar
+    _garantirHeadersRelatorio_DB_();
     
     // 1) LER PEDIDOS (usa IDs que estão na planilha)
     Logger.log("\n📖 1. LENDO PEDIDOS");
@@ -3046,7 +3118,7 @@ function sincronizarDados() {
       // Lê até o número real de colunas do DB (mín. 21 para cobrir LOTE em U)
       // Status em O (índice 14), MARCAR_FATURAR em P (índice 15),
       // DATA_STATUS em Q (índice 16), CÓDIGO_FIXO em S (índice 18), INFO_X em T (índice 19), LOTE em U (índice 20)
-      const dbNumCols = Math.max(21, dbSheet.getLastColumn());
+      const dbNumCols = Math.min(Math.max(DB_CONFERENCIA_SAIDA_COL + 1, dbSheet.getLastColumn()), dbSheet.getMaxColumns());
       dbData = dbSheet.getRange(2, 1, dbRows, dbNumCols).getValues();
     }
 
@@ -3125,10 +3197,20 @@ function sincronizarDados() {
     // uma vez com a coluna ORD. COMPRA deslocada em uma linha: 68 cópias entraram de uma só vez.
     // Só conta itens em aberto — se a contraparte já está Faturado/Finalizado/Excluido, o item
     // pode legitimamente voltar numa nova OC e a inserção deve passar.
+    // Linha já sinalizada como saída da origem (PENDENTE) ou conferida como "continua aberto"
+    // (ABERTO): o sistema já concluiu que ela não tem mais linha na origem. Não conta como "aberta"
+    // nas contagens de identidade — senão bloquearia a entrada de uma linha nova igual e faria o
+    // orçamento de excedente escolher outra irmã no lugar dela.
+    const _saidaJaTratada_ = (row) => {
+      const c = _lerConferencia_(row);
+      return !!c && (c.tipo === 'PENDENTE' || c.tipo === 'ABERTO');
+    };
+
     const dbIdentidadesAbertas = new Map();
     for (let [, dbItem] of dbMap.entries()) {
       const st = String(dbItem.row[STATUS_COL] || '').trim();
       if (st === 'Faturado' || st === 'Finalizado' || st === 'Excluido') continue;
+      if (_saidaJaTratada_(dbItem.row)) continue;
       const ident = _criarImpressaoDigitalSemOC_(dbItem.row, true);
       if (ident) dbIdentidadesAbertas.set(ident, (dbIdentidadesAbertas.get(ident) || 0) + 1);
     }
@@ -3216,6 +3298,7 @@ function sincronizarDados() {
     for (const [, dbi] of dbMap.entries()) {
       const s = String(dbi.row[STATUS_COL] || '').trim();
       if (s === 'Faturado' || s === 'Finalizado' || s === 'Excluido') continue;
+      if (_saidaJaTratada_(dbi.row)) continue;
       const oc = String(dbi.row[DB_OC_COL] || '').trim();
       const os = String(dbi.row[10] || '').trim();
       const k = `${oc}|${os}`;
@@ -3233,6 +3316,7 @@ function sincronizarDados() {
     for (const [, dbi] of dbMap.entries()) {
       const s2 = String(dbi.row[STATUS_COL] || '').trim();
       if (s2 === 'Faturado' || s2 === 'Finalizado' || s2 === 'Excluido') continue;
+      if (_saidaJaTratada_(dbi.row)) continue;
       const ident = _identidadeItem_(dbi.row[CLIENTE_COL], dbi.row[DB_PEDIDO_COL], dbi.row[DB_MARFIM_COL], dbi.row[DB_TAM_COL], dbi.row[DB_DESC_COL]);
       if (ident) dbAbertasPorIdent.set(ident, (dbAbertasPorIdent.get(ident) || 0) + 1);
     }
@@ -3292,6 +3376,7 @@ function sincronizarDados() {
     for (const [, dbi] of dbMap.entries()) {
       const s3 = String(dbi.row[STATUS_COL] || '').trim();
       if (s3 === 'Faturado' || s3 === 'Finalizado' || s3 === 'Excluido') continue;
+      if (_saidaJaTratada_(dbi.row)) continue;
       totalAbertos++;
       if (_motivoSaidaDaFonte_(dbi.row, orcamentoPrevia)) totalSemFonte++;
     }
@@ -3308,13 +3393,15 @@ function sincronizarDados() {
     const importParcial = propsFonte.getProperty('IMPORT_PARCIAL_ULTIMA_RODADA') === 'true';
     if (importParcial) Logger.log(`   🚧 Última importação veio parcial — auto-faturamento suspenso nesta rodada`);
 
-    const autoFaturarSaidaFonte = (fonteIdent.size > 0)
+    // Fonte confiável nesta rodada: só então uma saída da origem é sinalizada (PENDENTE) ou o item
+    // marcado pelo usuário é faturado. Numa rodada suspeita nada é tratado — a seguinte decide.
+    const fonteConfiavel = (fonteIdent.size > 0)
       && (fonteLinhasLidas >= MIN_LINHAS_FONTE_PARA_FATURAR)
       && (fracaoSemFonte <= MAX_FRACAO_SEM_FONTE)
       && !quedaBrusca
       && !importParcial;
-    if (!autoFaturarSaidaFonte) {
-      Logger.log(`   🚧 Auto-faturamento por saída da fonte DESLIGADO nesta rodada ` +
+    if (!fonteConfiavel) {
+      Logger.log(`   🚧 Tratamento de saídas da origem SUSPENSO nesta rodada ` +
                  `(linhas na fonte=${fonteLinhasLidas}, anterior=${totalAnterior}${quedaBrusca ? ' → QUEDA BRUSCA' : ''}, ` +
                  `sem correspondência=${totalSemFonte}/${totalAbertos} = ${(fracaoSemFonte * 100).toFixed(1)}%)`);
     } else {
@@ -3334,6 +3421,8 @@ function sincronizarDados() {
     // São coletados primeiro e processados depois, ordenados por QTD.ABERTA crescente,
     // garantindo que QTD=0 (totalmente baixados) sejam tratados antes dos parciais.
     const itensFaturarPendentes = [];
+    // Itens que saíram da origem SEM marcação de usuário: ficam Ativos, com aviso na tela (col AA).
+    const itensPendentesConferencia = [];
 
     // Quantas linhas do DB de cada fingerprint já foram "consumidas" (matched por ID, UUID ou
     // fingerprint). Serve para liberar a mesma fingerprint a novos itens legítimos — vários
@@ -3408,6 +3497,9 @@ function sincronizarDados() {
     // nova tentativa de match adicionada à Passada 1 deve resolver para TODOS os itens antes de
     // qualquer lógica de Passada 2 ler fonteMap/fonteImpressoes.
     const pendentes = [];
+    // Linhas do DB que voltaram a casar com a origem (ID, UUID ou impressão digital): se estavam
+    // PENDENTE/ABERTO, a pendência é apagada no fim da rodada — o item voltou.
+    const linhasCasadas = new Set();
 
     // ============ PASSADA 1: PRIMEIRA TENTATIVA (ID) + SEGUNDA TENTATIVA (UUID) ============
     for (let [id, dbItem] of dbEntriesParaProcessar) {
@@ -3533,6 +3625,7 @@ function sincronizarDados() {
         }
 
         fonteMap.delete(id);
+        linhasCasadas.add(dbItem.linha);
         // Marca slot no fonteImpressoes como usado — sem isso, itens excluídos da fonte
         // conseguem fazer fingerprint match com este slot e não são marcados como Faturado.
         const fpFonteId = _criarImpressaoDigital_(fonteRow);
@@ -3591,6 +3684,7 @@ function sincronizarDados() {
           idsAtualizados.push({ de: id, para: novoId, linha: dbItem.linha });
 
           fonteMap.delete(novoId);
+          linhasCasadas.add(dbItem.linha);
           fonteCodigoFixoMap.delete(cfDb); // consome este UUID para não reutilizar
 
           // Marca como usado no fonteImpressoes para evitar double-match por fingerprint
@@ -3693,6 +3787,7 @@ function sincronizarDados() {
         // Não apaga a chave do fonteImpressoes — apenas o slot foi marcado como usado,
         // permitindo que outros DB-items com a mesma fingerprint ainda encontrem seus slots.
         fonteMap.delete(novoId);
+        linhasCasadas.add(dbItem.linha);
         _consumirFingerprint_(impressaoDB); // libera fingerprint para novos itens idênticos legítimos
         _consumirIdentidade_(dbItem.row);
 
@@ -3764,48 +3859,36 @@ function sincronizarDados() {
         }
 
         if (!itemAindaEmPedidosPorFingerprint && statusAtual !== "Faturado" && statusAtual !== "Finalizado" && statusAtual !== "Excluido") {
-          // Distingue "marcado pelo usuário" de "marcado automaticamente pelo sync":
-          // MARCAR_FATURAR_USUARIO_COL (col V) fica preenchido quando o usuário marca via UI;
-          // fica vazio quando o próprio sync define MARCAR_FATURAR="SIM" automaticamente.
-          // OBS: idsComAlertaAtivo não é mais usado porque _registrarAlertaFaturamento_ está desativada
-          // e o Set ficava sempre vazio, tornando a distinção inoperante.
-          const marcarFaturarUsuario = String(dbItem.row[MARCAR_FATURAR_USUARIO_COL] || '').trim();
+          // REGRA: nenhum item vira Faturado sem usuário identificado.
+          //   • marcado pelo usuário (MARCAR_FATURAR=SIM + col V preenchida) e saiu da origem → Faturado
+          //   • qualquer outra saída (QTD>0, QTD=0 com ou sem baixa, "SIM" legado sem usuário)
+          //     → coluna AA = PENDENTE: continua Ativo e aparece no aviso da tela para um usuário decidir.
+          // Em 26/10/2026 uma leitura da fonte sem 101 itens recém-chegados os faturou sozinho; ao
+          // voltarem, continuaram Faturados (o sync preserva Faturado). Inferência automática não basta.
+          // As travas de importação (fonteConfiavel) valem para os dois caminhos: numa rodada suspeita
+          // nada é tratado e a rodada seguinte decide com a fonte completa.
+          // A marcação é conferida ANTES da pendência: se o usuário marcou um item que já estava
+          // pendente, a marcação dele é a decisão.
+          const marcarFaturarUsuario = _usuarioDaMarcacao_(dbItem.row[MARCAR_FATURAR_USUARIO_COL]);
           const marcadoPeloUsuario = aguardandoNF && marcarFaturarUsuario !== '';
-          const motivoSaida = _motivoSaidaDaFonte_(dbItem.row, excedentePorIdent);
+          const conferencia = _lerConferencia_(dbItem.row);
           if (marcadoPeloUsuario) {
-            // MARCAR_FATURAR=SIM posto pelo USUÁRIO (col V preenchida) → saída esperada → Faturado direto
-            Logger.log(`   ✋→✅ Marcado pelo usuário (${marcarFaturarUsuario}) + saiu do PEDIDOS → Faturado direto (QTD=${qtdAberta}, ID="${id}")`);
-            itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: 0, marcadoParaNF: true });
-          } else if (qtdAberta === 0) {
-            // QTD=0 sem marcação: baixas zeraram o item → faturado silencioso
-            itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: 0 });
-          } else if (motivoSaida && autoFaturarSaidaFonte) {
-            // QTD>0 e o item sumiu de PEDIDOS *e* de DADOS_IMPORTADOS → saiu do sistema de origem.
-            // Antes esta linha recebia MARCAR_FATURAR="SIM" e continuava Ativo — um estado que
-            // ninguém resolvia: os alertas estão desativados (_registrarAlertaFaturamento_ é no-op),
-            // a rodada seguinte via "marcação sem usuário" e não agia, e limparMarcacoesSemUsuario()
-            // (chamada pelo HTML ao gerar relatório) apagava a marcação. O item ficava Ativo para
-            // sempre, visível no card da OC e nunca faturado.
-            Logger.log(`   📤→✅ Saiu da fonte (${motivoSaida}) → Faturado (QTD=${qtdAberta}, ID="${id}")`);
-            itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: qtdAberta, saiuDaFonte: motivoSaida });
-            if (temBaixas) {
-              // Item com baixa parcial que sumiu da fonte: fatura, mas avisa no HTML —
-              // o saldo aberto registrado não bate com o que a origem entregou.
-              avisos.push({
-                id: id,
-                cartela: String(dbItem.row[CARTELA_COL]   || ''),
-                cliente: String(dbItem.row[CLIENTE_COL]   || ''),
-                pedido:  String(dbItem.row[DB_PEDIDO_COL] || '')
-              });
+            if (fonteConfiavel) {
+              Logger.log(`   ✋→✅ Marcado pelo usuário (${marcarFaturarUsuario}) + saiu da origem → Faturado (QTD=${qtdAberta}, ID="${id}")`);
+              itensFaturarPendentes.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: qtdAberta, usuario: marcarFaturarUsuario });
+            } else {
+              Logger.log(`   🚧 Marcado pelo usuário, mas a fonte está suspeita nesta rodada → aguarda (ID="${id}")`);
             }
-          } else if (aguardandoNF) {
-            // MARCAR_FATURAR=SIM posto pelo SYNC em versão anterior (col V vazia) e a fonte ainda
-            // reconhece o item → mantém Ativo e aguarda o usuário concluir pela UI.
-            Logger.log(`   ⚠️ MARCAR_FATURAR automático (sem usuário) — mantido Ativo, aguarda confirmação (QTD=${qtdAberta}, ID="${id}")`);
+          } else if (conferencia && (conferencia.tipo === 'PENDENTE' || conferencia.tipo === 'ABERTO')) {
+            Logger.log(`   ⏸️ Saída já sinalizada (${conferencia.tipo}) — aguardando o usuário (ID="${id}")`);
           } else {
-            // QTD>0 e a fonte ainda pode reconhecer o item (ID/fingerprint desalinhado, importação
-            // parcial ou válvula de segurança acionada) → não escreve nada, aguarda reconsolidação.
-            Logger.log(`   ⏭️ Sem prova de saída da fonte (QTD=${qtdAberta}, proteção OC+OS=${protecaoAtiva ? 'ativa' : 'inativa'}) → aguarda reconsolidação — OC+OS="${chaveOcOs}"`);
+            const motivoSaida = _motivoSaidaDaFonte_(dbItem.row, excedentePorIdent);
+            if (motivoSaida && fonteConfiavel) {
+              Logger.log(`   📤→⏸️ Saiu da origem sem marcação (${motivoSaida}) → PENDENTE de conferência (QTD=${qtdAberta}, ID="${id}")`);
+              itensPendentesConferencia.push({ id: id, linha: dbItem.linha, row: dbItem.row, statusAtual: statusAtual, qtdAberta: qtdAberta, motivo: motivoSaida, temBaixas: temBaixas });
+            } else {
+              Logger.log(`   ⏭️ Sem prova de saída da fonte (QTD=${qtdAberta}, proteção OC+OS=${protecaoAtiva ? 'ativa' : 'inativa'}) → aguarda reconsolidação — OC+OS="${chaveOcOs}"`);
+            }
           }
         } else if (!itemAindaEmPedidosPorFingerprint) {
           Logger.log(`   ℹ️ Não alterado (status: ${statusAtual})`);
@@ -3813,30 +3896,40 @@ function sincronizarDados() {
       }
     }
     
-    // === PROCESSAR ITENS QUE SAÍRAM DO PEDIDOS (ordenado por QTD.ABERTA crescente) ===
-    // Ordena: QTD=0 primeiro (faturamento silencioso), QTD>0 por último (gera alerta).
-    // Com múltiplos itens idênticos na mesma OC, isso garante que os totalmente
-    // baixados sejam os primeiros a sair, e só gera alerta se realmente há QTD parcial.
+    // === ITENS QUE SAÍRAM DA ORIGEM ===
+    // Faturado: só os marcados por um usuário. A marcação é conferida de novo imediatamente
+    // antes de gravar (_mesclarAlteracoesConcorrentes_) — desmarcado no meio do sync não fatura.
     itensFaturarPendentes.sort((a, b) => a.qtdAberta - b.qtdAberta);
-
     if (itensFaturarPendentes.length > 0) {
-      Logger.log(`\n🔄 Processando ${itensFaturarPendentes.length} item(ns) que saíram do PEDIDOS (ordenado por QTD.ABERTA):`);
+      Logger.log(`\n🔄 ${itensFaturarPendentes.length} item(ns) marcado(s) pelo usuário saíram da origem → Faturado:`);
     }
-
-    itensFaturarPendentes.forEach(({ id, linha, row, statusAtual, qtdAberta, marcadoParaNF, saiuDaFonte }) => {
-      const linhaAtualizar = [...row];
-
-      // Todo item que chega aqui já provou ter saído da origem — por baixa completa (QTD=0),
-      // por marcação do usuário, ou por não existir mais em PEDIDOS nem em DADOS_IMPORTADOS.
-      linhaAtualizar[STATUS_COL]         = "Faturado";
-      linhaAtualizar[DATA_STATUS_COL]    = new Date();
-      linhaAtualizar[MARCAR_FATURAR_COL] = "";
-      updates.push({ linha: linha, dados: linhaAtualizar, de: statusAtual, para: "Faturado", id: id });
+    itensFaturarPendentes.forEach(({ id, linha, row, statusAtual, qtdAberta, usuario }) => {
+      const linhaAtualizar = _linhaComLargura_(row, DB_CONFERENCIA_SAIDA_COL + 1);
+      linhaAtualizar[STATUS_COL]               = "Faturado";
+      linhaAtualizar[DATA_STATUS_COL]          = new Date();
+      linhaAtualizar[MARCAR_FATURAR_COL]       = "";
+      linhaAtualizar[DB_CONFERENCIA_SAIDA_COL] = _textoConferencia_('FATURADO', usuario, 'marcado pelo usuário');
+      updates.push({
+        linha: linha, dados: linhaAtualizar, de: statusAtual, para: "Faturado", id: id,
+        colsIntencionais: [STATUS_COL, DATA_STATUS_COL, MARCAR_FATURAR_COL, DB_CONFERENCIA_SAIDA_COL],
+        exigeMarcacao: true
+      });
       autoExcluidos++;
-      const causa = marcadoParaNF ? 'Marcado p/ NF + saiu'
-                  : (saiuDaFonte ? `Saiu da fonte (${saiuDaFonte}, QTD.ABERTA=${qtdAberta})`
-                                 : 'QTD.ABERTA=0');
-      Logger.log(`   ✅ ${causa} → Faturado (ID="${id}")`);
+      Logger.log(`   ✅ Marcado por ${usuario} + saiu da origem → Faturado (QTD.ABERTA=${qtdAberta}, ID="${id}")`);
+    });
+
+    // PENDENTE: saiu da origem sem marcação → aviso na tela; o status não muda.
+    if (itensPendentesConferencia.length > 0) {
+      Logger.log(`\n⏸️ ${itensPendentesConferencia.length} item(ns) saíram da origem sem marcação → PENDENTE (aviso na tela):`);
+    }
+    itensPendentesConferencia.forEach(({ id, linha, row, statusAtual, qtdAberta, motivo, temBaixas }) => {
+      const linhaAtualizar = _linhaComLargura_(row, DB_CONFERENCIA_SAIDA_COL + 1);
+      linhaAtualizar[DB_CONFERENCIA_SAIDA_COL] =
+        _textoConferencia_('PENDENTE', 'sistema', motivo + (temBaixas ? ' / com baixa registrada' : ''));
+      updates.push({
+        linha: linha, dados: linhaAtualizar, de: statusAtual, para: `${statusAtual} + PENDENTE`, id: id,
+        colsIntencionais: [DB_CONFERENCIA_SAIDA_COL]
+      });
     });
 
     // Novos itens que estão em PEDIDOS mas não em Relatorio_DB
@@ -4034,10 +4127,37 @@ function sincronizarDados() {
       Logger.log(`   ✅ ${novosValidados.length} novos adicionados`);
     }
     if (updates.length > 0) {
+      // Relê as linhas que serão regravadas: o sync dura minutos e o usuário pode ter dado baixa,
+      // marcado ou excluído nesse meio-tempo — o valor dele não pode ser desfeito pelo snapshot antigo.
+      _mesclarAlteracoesConcorrentes_(dbSheet, dbData, updates);
       updates.forEach(u => {
+        if (u.cancelado) return;
         dbSheet.getRange(u.linha, 1, 1, u.dados.length).setValues([u.dados]);
         Logger.log(`   ✅ Linha ${u.linha}: ${u.de} → ${u.para} | ID: ${u.id}`);
+        // Faturamento por marcação entra no histórico só depois de gravado (desmarcado no meio → cancelado)
+        if (u.exigeMarcacao) {
+          _registrarDecisao_('FATURADO', _usuarioDaMarcacao_(u.dados[MARCAR_FATURAR_USUARIO_COL]),
+            'marcado pelo usuário + saiu da origem (sincronização)', u.dados, `status anterior: ${u.de}`);
+        }
       });
+      _gravarDecisoes_();
+    }
+
+    // Item que estava PENDENTE/ABERTO e voltou a casar com a origem: a pendência some sozinha.
+    // Relê a célula antes de apagar — um usuário pode ter respondido o aviso durante o sync.
+    let pendenciasResolvidas = 0;
+    linhasCasadas.forEach(linha => {
+      const antes = dbData[linha - 2];
+      const c = _lerConferencia_(antes);
+      if (!c || (c.tipo !== 'PENDENTE' && c.tipo !== 'ABERTO')) return;
+      const celula = dbSheet.getRange(linha, DB_CONFERENCIA_SAIDA_COL + 1);
+      const agora = String(celula.getValue() || '').trim();
+      if (agora !== c.texto) return;
+      celula.setValue('');
+      pendenciasResolvidas++;
+    });
+    if (pendenciasResolvidas > 0) {
+      Logger.log(`   ✅ ${pendenciasResolvidas} pendência(s) de conferência apagada(s) — item voltou à origem`);
     }
     // Persiste avisos de itens parcializados que saíram do PEDIDOS
     if (avisos.length > 0) {
@@ -4159,6 +4279,58 @@ function sincronizarDados() {
   } catch (error) {
     Logger.log("\n❌ ERRO: " + error.message);
     throw error;
+  }
+}
+
+/**
+ * Concorrência otimista antes de gravar. As ações de usuário (baixa, marcação, exclusão,
+ * resposta do aviso) não usam a trava do sync, e o sync regrava linhas inteiras com o que leu
+ * no início — e ele dura minutos. Aqui as linhas que vão ser regravadas são relidas e, em cada
+ * coluna que mudou desde aquela leitura, o valor ATUAL é mantido: a ação do usuário não é desfeita.
+ * Exceções: colunas que a atualização muda de propósito (u.colsIntencionais), e o faturamento
+ * por marcação (u.exigeMarcacao), que é cancelado se o item não estiver mais marcado por um
+ * usuário ou tiver mudado de status. Linha que trocou de item (ID diferente) não é gravada.
+ */
+function _mesclarAlteracoesConcorrentes_(dbSheet, dbData, updates) {
+  const alvos = updates.filter(u => u.linha >= 2 && (u.linha - 2) < dbData.length);
+  if (alvos.length === 0) return;
+  let minLinha = Infinity, maxLinha = 0, largura = 0;
+  alvos.forEach(u => {
+    if (u.linha < minLinha) minLinha = u.linha;
+    if (u.linha > maxLinha) maxLinha = u.linha;
+    if (u.dados.length > largura) largura = u.dados.length;
+  });
+  const larguraLida = Math.min(largura, dbSheet.getMaxColumns());
+  const atuais = dbSheet.getRange(minLinha, 1, maxLinha - minLinha + 1, larguraLida).getValues();
+  const norm = (v) => (v instanceof Date) ? ('D' + v.getTime()) : String(v === null || v === undefined ? '' : v).trim();
+
+  let mescladas = 0, canceladas = 0;
+  alvos.forEach(u => {
+    const antes = dbData[u.linha - 2];
+    const agora = atuais[u.linha - minLinha];
+    if (!antes || !agora) return;
+    if (norm(agora[ID_COL]) !== norm(antes[ID_COL])) {
+      u.cancelado = true; canceladas++;
+      Logger.log(`   ⚠️ Linha ${u.linha} mudou de item durante o sync — gravação adiada para a próxima rodada`);
+      return;
+    }
+    if (u.exigeMarcacao) {
+      const marcadoAgora = norm(agora[MARCAR_FATURAR_COL]).toUpperCase() === 'SIM'
+        && norm(agora[MARCAR_FATURAR_USUARIO_COL]) !== '';
+      if (!marcadoAgora || norm(agora[STATUS_COL]) !== norm(antes[STATUS_COL])) {
+        u.cancelado = true; canceladas++;
+        Logger.log(`   ✋ Faturamento cancelado: ID="${u.id}" foi desmarcado ou alterado durante o sync`);
+        return;
+      }
+    }
+    const intencionais = new Set(u.colsIntencionais || []);
+    for (let c = 0; c < u.dados.length && c < agora.length; c++) {
+      if (intencionais.has(c)) continue;
+      if (norm(agora[c]) !== norm(antes[c])) { u.dados[c] = agora[c]; mescladas++; }
+    }
+  });
+  if (mescladas > 0 || canceladas > 0) {
+    Logger.log(`   🔒 Concorrência: ${mescladas} célula(s) alterada(s) por usuário preservada(s), ${canceladas} gravação(ões) cancelada(s)/adiada(s)`);
   }
 }
 
@@ -4920,7 +5092,8 @@ const RELATORIO_DB_HEADERS = [
   'LOTE_EMISSAO',           // W - lote de emissão do relatório de faturamento (FAT-001, FAT-002…)
   'PERFIL_EMISSAO',         // X - perfil de baixa (BAIXA1…BAIXA5)
   'SEQUENCIA',              // Y - sequência do item dentro da OC conforme aba "original" (fixa)
-  'INFO_Y'                  // Z - campo da coluna Y da fonte (informação adicional da OC, exibida junto da marca)
+  'INFO_Y',                 // Z - campo da coluna Y da fonte (informação adicional da OC, exibida junto da marca)
+  'CONFERENCIA_SAIDA'       // AA - conferência de item que saiu da origem sem marcação (DB_CONFERENCIA_SAIDA_COL)
 ];
 
 /**
@@ -4936,6 +5109,11 @@ function _garantirHeadersRelatorio_DB_() {
     if (!sheet) {
       Logger.log(`📝 Criando aba ${DB_SHEET_NAME}...`);
       sheet = getSpreadsheet_().insertSheet(DB_SHEET_NAME);
+    }
+
+    // Garante espaço físico para todas as colunas esperadas (a AA, CONFERENCIA_SAIDA, é nova)
+    if (sheet.getMaxColumns() < RELATORIO_DB_HEADERS.length) {
+      sheet.insertColumnsAfter(sheet.getMaxColumns(), RELATORIO_DB_HEADERS.length - sheet.getMaxColumns());
     }
 
     // Verifica se a linha 1 está vazia ou sem ID_UNICO
@@ -5062,6 +5240,7 @@ function _rowToItem_(row, displayRow, colMap, rowIndex) {
     LOTE_EMISSAO:    getDisp('LOTE_EMISSAO',    ''),
     PERFIL_EMISSAO:  getDisp('PERFIL_EMISSAO',  ''),
     SEQUENCIA:       getDisp('SEQUENCIA',       ''),
+    CONFERENCIA_SAIDA: getDisp('CONFERENCIA_SAIDA', ''),
     // Posição original em DADOS_IMPORTADOS — lida por índice fixo (col R = índice 17 no DB)
     posicaoFonte: (typeof row[DB_POSICAO_FONTE_COL] === 'number' && !isNaN(row[DB_POSICAO_FONTE_COL]))
       ? row[DB_POSICAO_FONTE_COL]
@@ -5187,10 +5366,45 @@ function fetchAllDataUnified(cacheBuster) {
       excluidos: itemsWeb.filter(i => i.Status === 'Excluido').length
     };
     
+    // Itens que saíram da origem sem marcação e aguardam um usuário (coluna AA = PENDENTE).
+    // "gemeo" = outra linha aberta do mesmo PEDIDO com o mesmo LOTE: provável duplicata.
+    const _pendente_ = (i) => String(i.CONFERENCIA_SAIDA || '').toUpperCase().indexOf('PENDENTE') === 0;
+    const _aberto_ = (i) => i.Status !== 'Faturado' && i.Status !== 'Finalizado' && i.Status !== 'Excluido';
+    const vivosPorPedidoLote = new Map();
+    itemsWeb.forEach(i => {
+      if (!_aberto_(i) || _pendente_(i)) return;
+      const lote = String(i.LOTE || '').trim();
+      if (!lote) return;
+      const k = `${i.PEDIDO}|${lote}`;
+      if (!vivosPorPedidoLote.has(k)) vivosPorPedidoLote.set(k, i);
+    });
+    const pendentesSaida = itemsWeb.filter(i => _aberto_(i) && _pendente_(i)).map(i => {
+      const partes = String(i.CONFERENCIA_SAIDA).split('|');
+      const lote = String(i.LOTE || '').trim();
+      const gemeo = lote ? vivosPorPedidoLote.get(`${i.PEDIDO}|${lote}`) : null;
+      return {
+        uniqueId: i.uniqueId,
+        planilhaLinha: i.planilhaLinha,
+        cliente: i.CLIENTE,
+        pedido: i.PEDIDO,
+        oc: i['ORD. COMPRA'],
+        descricao: i['DESCRIÇÃO'],
+        tamanho: i.TAMANHO,
+        lote: lote,
+        qtdAberta: i['QTD. ABERTA'],
+        qtdOriginal: i['QTD. ORIGINAL'],
+        saiuEm: partes[2] || '',
+        motivo: partes[3] || '',
+        gemeo: gemeo ? { uniqueId: gemeo.uniqueId, oc: gemeo['ORD. COMPRA'], qtdAberta: gemeo['QTD. ABERTA'] } : null
+      };
+    });
+    stats.pendentesSaida = pendentesSaida.length;
+
     const result = {
       success: true,
       ordCompras: ordCompras, // payload enxuto
       stats: stats,
+      pendentesSaida: pendentesSaida,
       meta: {
         version: APP_VERSION,
         timestamp: new Date().toISOString(),
@@ -5258,45 +5472,144 @@ function getItensForOrdCompra(ordCompraId) {
 }
 
 // ====== AÇÕES (com validação de linha e batches tolerantes) ======
-function marcarFaturado(uniqueId, planilhaLinha) {
+// marcarFaturado() foi REMOVIDA: faturava direto, sem usuário identificado, e nenhuma tela a chamava.
+// Faturado só nasce pela marcação do usuário (marcarParaFaturar → sync) ou pela resposta ao aviso
+// de conferência (confirmarSaidaFonte).
+
+// ====== CONFERÊNCIA DE ITENS QUE SAÍRAM DA ORIGEM SEM MARCAÇÃO (coluna AA) ======
+
+/**
+ * Linha atual do item no Relatorio_DB conferindo o ID: a tela envia a linha que viu ao carregar,
+ * mas linhas podem ser apagadas/inseridas entre o carregamento e o clique (purga, sync). Se o ID
+ * da linha enviada não bate, procura o item pelo ID; sem achar, recusa em vez de agir no item errado.
+ */
+function _resolverLinhaDoItem_(sheet, uniqueId, planilhaLinha) {
+  const id = String(uniqueId || '').trim();
+  const linhaNum = Number(planilhaLinha);
+  const ultima = sheet.getLastRow();
+  const linhaValida = isFinite(linhaNum) && linhaNum >= 2 && linhaNum <= ultima;
+  if (!id) {
+    if (!linhaValida) throw new Error(`Linha inválida: ${planilhaLinha}`);
+    return linhaNum;
+  }
+  if (linhaValida && String(sheet.getRange(linhaNum, ID_COL + 1).getValue() || '').trim() === id) {
+    return linhaNum;
+  }
+  if (ultima >= 2) {
+    const ids = sheet.getRange(2, ID_COL + 1, ultima - 1, 1).getValues();
+    for (let i = 0; i < ids.length; i++) {
+      if (String(ids[i][0] || '').trim() === id) {
+        Logger.log(`   ↪️ Item "${id}" estava na linha ${planilhaLinha} e agora está na ${i + 2} — usando a linha atual`);
+        return i + 2;
+      }
+    }
+  }
+  throw new Error(`Item "${id}" não encontrado no Relatorio_DB — recarregue a tela.`);
+}
+
+// ====== HISTÓRICO PERMANENTE DE DECISÕES ======
+// Registro de quem decidiu o quê (faturou, cancelou, "continua aberto"…). A coluna AA some quando a
+// linha é purgada; esta aba não. Só recebe linhas novas: o código nunca apaga nem limita esta aba.
+const HISTORICO_SHEET_NAME = 'Historico_Decisoes';
+const HISTORICO_HEADERS = ['DATA_HORA', 'EVENTO', 'USUARIO', 'ORIGEM', 'ID_UNICO', 'CLIENTE', 'PEDIDO',
+  'ORD. COMPRA', 'CÓD. MARFIM', 'DESCRIÇÃO', 'TAMANHO', 'LOTE', 'QTD. ABERTA', 'DETALHE'];
+let _decisoesPendentes_ = [];
+
+/** Acumula em memória; _gravarDecisoes_() grava tudo de uma vez (uma escrita por execução). */
+function _registrarDecisao_(evento, usuario, origem, row, detalhe) {
+  _decisoesPendentes_.push([
+    new Date(), String(evento || ''), String(usuario || ''), String(origem || ''),
+    String(row[ID_COL] || ''), String(row[CLIENTE_COL] || ''), String(row[DB_PEDIDO_COL] || ''),
+    String(row[DB_OC_COL] || ''), String(row[DB_MARFIM_COL] || ''), _descBase_(row[DB_DESC_COL]),
+    String(row[DB_TAM_COL] || ''), String(row[DB_LOTE_COL] || ''), row[DB_QTD_COL], String(detalhe || '')
+  ]);
+}
+
+function _gravarDecisoes_() {
+  if (_decisoesPendentes_.length === 0) return true;
+  const linhas = _decisoesPendentes_;
+  _decisoesPendentes_ = [];
   try {
-    const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
-    const linhaNum = Number(planilhaLinha);
-    if (!sheet) throw new Error("Aba DB não encontrada");
-    if (!isFinite(linhaNum) || linhaNum < 2 || linhaNum > sheet.getLastRow()) {
-      throw new Error(`Linha inválida: ${planilhaLinha}`);
+    const ss = getSpreadsheet_();
+    let aba = ss.getSheetByName(HISTORICO_SHEET_NAME);
+    if (!aba) {
+      aba = ss.insertSheet(HISTORICO_SHEET_NAME);
+      aba.getRange(1, 1, 1, HISTORICO_HEADERS.length).setValues([HISTORICO_HEADERS]).setFontWeight('bold').setBackground('#f0f2f5');
+      aba.setFrozenRows(1);
     }
-
-    // Lê cabeçalhos para encontrar coluna Status dinamicamente
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const colMap = _getColumnIndexes_(headers);
-    const statusCol = colMap['Status'];
-
-    if (statusCol === undefined) {
-      throw new Error("Coluna 'Status' não encontrada");
-    }
-
-    // Lê QTD.ABERTA antes de faturar para registrar checkpoint se for faturamento parcial
-    const qtdACol = colMap['QTD. ABERTA'];
-    const qtdAbertaAtual = qtdACol !== undefined
-      ? _toNumber_(sheet.getRange(linhaNum, qtdACol + 1).getValue())
-      : 0;
-
-    sheet.getRange(linhaNum, statusCol + 1).setValue("Faturado");
-    sheet.getRange(linhaNum, DATA_STATUS_COL + 1).setValue(new Date()); // Q: data do status
-
-    // Se ainda há saldo aberto (faturamento parcial), registra checkpoint para que o próximo
-    // relatório de faturamento mostre apenas as baixas realizadas após este ponto.
-    if (qtdAbertaAtual > 0 && uniqueId) {
-      _registrarCheckpointFaturamento_(uniqueId, qtdAbertaAtual);
-    }
-
-    limparCache();
-    Logger.log(`💰 ${uniqueId || 'sem-id'} → Faturado (linha ${linhaNum}) | QTD.ABERTA: ${qtdAbertaAtual}`);
-    return { success: true, id: uniqueId || null, linha: linhaNum };
+    aba.getRange(aba.getLastRow() + 1, 1, linhas.length, HISTORICO_HEADERS.length).setValues(linhas);
+    return true;
   } catch (e) {
-    Logger.log(`❌ marcarFaturado: ${e.message}`);
-    return { success: false, error: e.message, id: uniqueId || null, linha: planilhaLinha };
+    Logger.log(`❌ _gravarDecisoes_: ${e.message} — ${linhas.length} registro(s) não gravado(s)`);
+    return false;
+  }
+}
+
+/**
+ * Resposta de um usuário ao aviso "saiu da origem sem marcação" (coluna AA = PENDENTE).
+ * É o único caminho, além da marcação, que grava Faturado.
+ *   FATURADO  → Status Faturado (a NF foi emitida)
+ *   CANCELADO → Status Excluido (pedido cancelado)
+ *   DUPLICATA → Status Excluido (a mesma linha já está em outro item)
+ *   ABERTO    → nada muda no status; o aviso não pergunta de novo
+ * Só usuários de nível TOTAL (validado aqui, não só na tela). Decisão, usuário e data ficam na
+ * coluna AA e na aba Historico_Decisoes.
+ */
+function confirmarSaidaFonte(uniqueId, planilhaLinha, decisao, usuario) {
+  const DECISOES = { FATURADO: true, CANCELADO: true, DUPLICATA: true, ABERTO: true };
+  const dec = String(decisao || '').trim().toUpperCase();
+  const quem = String(usuario || '').trim();
+  let lock = null;
+  try {
+    if (!DECISOES[dec]) throw new Error(`Decisão inválida: ${decisao}`);
+    if (!quem) throw new Error('Usuário não identificado — faça login de novo.');
+    const nivel = obterNivelUsuario(quem);
+    if (!nivel || !nivel.success || nivel.nivel !== 'TOTAL') {
+      throw new Error('Somente usuários com acesso TOTAL podem responder este aviso.');
+    }
+
+    // Serializa respostas simultâneas ao mesmo aviso (a trava do script fica com o sync).
+    lock = LockService.getDocumentLock();
+    if (!lock.tryLock(10000)) throw new Error('Outra resposta está sendo gravada — tente de novo.');
+
+    const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
+    if (!sheet) throw new Error('Aba DB não encontrada');
+    _garantirHeadersRelatorio_DB_();
+    const linhaNum = _resolverLinhaDoItem_(sheet, uniqueId, planilhaLinha);
+    const row = sheet.getRange(linhaNum, 1, 1, DB_CONFERENCIA_SAIDA_COL + 1).getValues()[0];
+
+    const status = String(row[STATUS_COL] || '').trim();
+    const conf = _lerConferencia_(row);
+    if (status === 'Faturado' || status === 'Finalizado' || status === 'Excluido' || !conf || conf.tipo !== 'PENDENTE') {
+      throw new Error('Este item não está mais pendente (já foi respondido ou voltou à origem). Atualize a tela.');
+    }
+
+    const detalhe = {
+      FATURADO: 'confirmado no aviso: NF emitida',
+      CANCELADO: 'confirmado no aviso: pedido cancelado',
+      DUPLICATA: 'confirmado no aviso: duplicata de outra linha',
+      ABERTO: 'confirmado no aviso: continua aberto'
+    }[dec];
+
+    if (dec === 'ABERTO') {
+      sheet.getRange(linhaNum, DB_CONFERENCIA_SAIDA_COL + 1).setValue(_textoConferencia_('ABERTO', quem, detalhe));
+    } else {
+      // Status (O), MARCAR_FATURAR (P) e DATA_STATUS (Q) são contíguas: uma gravação só.
+      const novoStatus = (dec === 'FATURADO') ? 'Faturado' : 'Excluido';
+      sheet.getRange(linhaNum, STATUS_COL + 1, 1, 3).setValues([[novoStatus, '', new Date()]]);
+      sheet.getRange(linhaNum, DB_CONFERENCIA_SAIDA_COL + 1).setValue(_textoConferencia_(dec, quem, detalhe));
+    }
+    SpreadsheetApp.flush();
+    limparCache();
+    _registrarDecisao_(dec, quem, 'aviso de conferência (tela)', row, `${detalhe} — pendência: ${conf.texto}`);
+    _gravarDecisoes_();
+    Logger.log(`🧾 confirmarSaidaFonte: ID="${uniqueId}" → ${dec} por ${quem}`);
+    return { success: true, id: uniqueId, decisao: dec, linha: linhaNum };
+  } catch (e) {
+    Logger.log(`❌ confirmarSaidaFonte: ${e.message}`);
+    return { success: false, error: e.message, id: uniqueId || null };
+  } finally {
+    if (lock) { try { lock.releaseLock(); } catch (_) {} }
   }
 }
 
@@ -5837,76 +6150,7 @@ function limparTodosAlertas() {
 }
 
 // ====== UTILITÁRIO: CONFIRMAR TODOS OS ALERTAS (USO EM TESTES) ======
-/**
- * Marca como "Faturado" todos os itens do Relatorio_DB que possuem MARCAR_FATURAR="SIM"
- * e em seguida limpa todos os alertas pendentes.
- * Use apenas para testes ou correções em lote — não exige senha.
- */
-/**
- * Wrapper chamado pelo menu — exibe confirmação antes de executar.
- */
-function confirmarTodosAlertasMenu() {
-  const ui = SpreadsheetApp.getUi();
-  const resp = ui.alert(
-    '🧹 Confirmar todos os alertas de faturamento',
-    'Isso irá:\n\n' +
-    '• Marcar como "Faturado" todos os itens com MARCAR_FATURAR = SIM\n' +
-    '• Limpar todos os alertas pendentes no Relatorio_DB\n\n' +
-    'Use apenas para testes ou correções em lote. Deseja continuar?',
-    ui.ButtonSet.YES_NO
-  );
-  if (resp !== ui.Button.YES) {
-    Logger.log('ℹ️ confirmarTodosAlertasMenu: cancelado pelo usuário.');
-    return;
-  }
-  confirmarTodosAlertas();
-  ui.alert('✅ Concluído', 'Todos os alertas foram confirmados e os itens marcados como Faturado.', ui.ButtonSet.OK);
-}
-
-function confirmarTodosAlertas() {
-  const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
-  if (!sheet || sheet.getLastRow() < 2) {
-    Logger.log('⚠️ confirmarTodosAlertas: DB vazio ou não encontrado.');
-    return;
-  }
-
-  const lastRow  = sheet.getLastRow();
-  const lastCol  = Math.max(sheet.getLastColumn(), DATA_STATUS_COL + 1);
-  const dados    = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
-  const agora    = new Date();
-  let   marcados = 0;
-  let   alertasDismissed = 0;
-
-  dados.forEach((row, i) => {
-    const marcar = String(row[MARCAR_FATURAR_COL] || '').trim().toUpperCase();
-    if (marcar !== 'SIM') return;
-
-    const linhaSheet = i + 2;
-    const uniqueId   = String(row[ID_COL] || '').trim();
-    const qtdAberta  = _toNumber_(row[DB_QTD_COL]);
-
-    if (qtdAberta === 0) {
-      // QTD zerada: baixa foi feita — seguro marcar como Faturado
-      sheet.getRange(linhaSheet, STATUS_COL + 1).setValue('Faturado');
-      sheet.getRange(linhaSheet, MARCAR_FATURAR_COL + 1).setValue('');
-      sheet.getRange(linhaSheet, LOTE_EMISSAO_COL + 1).setValue('');
-      sheet.getRange(linhaSheet, DATA_STATUS_COL + 1).setValue(agora);
-      marcados++;
-      Logger.log(`💰 Linha ${linhaSheet} → Faturado (ID="${uniqueId}") | QTD.ABERTA: 0`);
-    } else {
-      // QTD ainda aberta: apenas descarta o alerta, mantém Ativo
-      sheet.getRange(linhaSheet, MARCAR_FATURAR_COL + 1).setValue('');
-      sheet.getRange(linhaSheet, LOTE_EMISSAO_COL + 1).setValue('');
-      alertasDismissed++;
-      Logger.log(`⚠️ Linha ${linhaSheet} → alerta descartado, mantido Ativo (ID="${uniqueId}") | QTD.ABERTA: ${qtdAberta}`);
-    }
-  });
-
-  PropertiesService.getScriptProperties().deleteProperty('ALERTAS_FATURAMENTO');
-  limparCache();
-
-  Logger.log(`✅ confirmarTodosAlertas: ${marcados} marcado(s) como Faturado, ${alertasDismissed} alerta(s) descartado(s) com QTD aberta.`);
-}
+// confirmarTodosAlertas()/confirmarTodosAlertasMenu() foram REMOVIDAS: faturavam em lote sem usuário.
 
 /**
  * Corrige itens com Status=Faturado mas QTD.ABERTA > 0 (marcados incorretamente).
@@ -5947,13 +6191,10 @@ function corrigirFaturadosComSaldoAberto() {
 
 // ====== ITENS QUE JÁ SAÍRAM DA ORIGEM E CONTINUAM EM ABERTO ======
 /**
- * Fatura de uma vez as linhas do Relatorio_DB que continuam em aberto embora o item já não
- * exista nem em PEDIDOS nem em DADOS_IMPORTADOS.
- *
- * Serve para limpar o passivo acumulado antes da correção do sync — daí em diante essas linhas
- * são resolvidas na própria sincronização e esta função deve encontrar zero itens. Ela existia
- * como buraco no fluxo: a linha ficava Ativo para sempre, aparecia no card da OC como se fosse
- * uma cópia do item e nunca exibia o selo FATURADO.
+ * SINALIZA (não fatura) as linhas do Relatorio_DB que continuam em aberto embora o item já não
+ * exista nem em PEDIDOS nem em DADOS_IMPORTADOS: grava coluna AA = PENDENTE e o item aparece no
+ * aviso de conferência da tela, onde um usuário decide Faturado / Cancelado / Continua aberto /
+ * Duplicata. O status NÃO muda aqui — nenhum item vira Faturado sem usuário identificado.
  *
  * Critério (o MESMO usado pelo sync, para não haver duas noções de "saiu da origem"):
  *   • o ID_UNICO e o CÓDIGO_FIXO não estão em PEDIDOS; E
@@ -5961,8 +6202,8 @@ function corrigirFaturadosComSaldoAberto() {
  *     (ou a linha exata sumiu e o grupo tem mais linhas em aberto no DB do que na fonte).
  *
  * Nunca roda com a fonte pequena ou com mais da metade do DB sem correspondência — nesse caso
- * o provável é importação quebrada, e faturar em massa seria destrutivo.
- * As linhas alteradas são registradas na aba "Itens_Fora_Da_Fonte" para auditoria.
+ * o provável é importação quebrada. As linhas sinalizadas são registradas na aba
+ * "Itens_Fora_Da_Fonte" para auditoria.
  */
 function faturarItensForaDaFonte() {
   const ui = SpreadsheetApp.getUi();
@@ -6015,14 +6256,22 @@ function faturarItensForaDaFonte() {
     }
 
     // 3) Relatorio_DB: contagem de linhas em aberto por identidade + seleção
-    const lastCol = Math.max(dbSheet.getLastColumn(), DB_CODIGO_FIXO_COL + 1);
+    _garantirHeadersRelatorio_DB_();
+    const lastCol = Math.min(Math.max(dbSheet.getLastColumn(), DB_CONFERENCIA_SAIDA_COL + 1), dbSheet.getMaxColumns());
     const dados = dbSheet.getRange(2, 1, dbSheet.getLastRow() - 1, lastCol).getValues();
+
+    // Linha já sinalizada (PENDENTE) ou conferida (ABERTO) fica fora de todas as contagens
+    const _jaTratada_ = (row) => {
+      const c = _lerConferencia_(row);
+      return !!c && (c.tipo === 'PENDENTE' || c.tipo === 'ABERTO');
+    };
 
     const abertasPorIdent = new Map();
     dados.forEach(row => {
       if (!String(row[ID_COL] || '').trim()) return;
       const st = String(row[STATUS_COL] || '').trim();
       if (st === 'Faturado' || st === 'Finalizado' || st === 'Excluido') return;
+      if (_jaTratada_(row)) return;
       const ident = _identidadeItem_(row[CLIENTE_COL], row[DB_PEDIDO_COL], row[DB_MARFIM_COL], row[DB_TAM_COL], row[DB_DESC_COL]);
       if (ident) abertasPorIdent.set(ident, (abertasPorIdent.get(ident) || 0) + 1);
     });
@@ -6042,6 +6291,7 @@ function faturarItensForaDaFonte() {
       if (!id) return;
       const st = String(row[STATUS_COL] || '').trim();
       if (st === 'Faturado' || st === 'Finalizado' || st === 'Excluido') return;
+      if (_jaTratada_(row)) return;
       totalAbertos++;
 
       const uuid = String(row[DB_CODIGO_FIXO_COL] || '').trim();
@@ -6070,10 +6320,11 @@ function faturarItensForaDaFonte() {
     }
 
     const resp = ui.alert(
-      '📤 Faturar itens que já saíram da origem',
+      '📤 Sinalizar itens que já saíram da origem',
       `${selecionadas.length} item(ns) continuam em aberto no ${DB_SHEET_NAME} mas já não existem ` +
       `nem em ${FONTE_SHEET_NAME} nem em ${IMPORTRANGE_SHEET_NAME}.\n\n` +
-      'Eles serão marcados como Faturado (com DATA_STATUS de hoje) e registrados na aba ' +
+      'Eles NÃO serão faturados: ganham o aviso "SAIU DA ORIGEM — CONFERIR" na tela, onde um usuário ' +
+      'decide (Faturado / Cancelado / Continua aberto / Duplicata). Ficam registrados na aba ' +
       '"Itens_Fora_Da_Fonte".\n\nContinuar?',
       ui.ButtonSet.YES_NO
     );
@@ -6084,7 +6335,7 @@ function faturarItensForaDaFonte() {
     if (!audSheet) {
       audSheet = ss.insertSheet('Itens_Fora_Da_Fonte');
       audSheet.getRange(1, 1, 1, 10).setValues([[
-        'DATA_FATURAMENTO', 'MOTIVO', 'ID_UNICO', 'QTD_ABERTA',
+        'DATA_SINALIZACAO', 'MOTIVO', 'ID_UNICO', 'QTD_ABERTA',
         'CARTELA', 'CLIENTE', 'PEDIDO', 'OC', 'DESC', 'TAMANHO'
       ]]);
     }
@@ -6097,28 +6348,25 @@ function faturarItensForaDaFonte() {
       ])
     );
 
-    // Status (O), MARCAR_FATURAR (P) e DATA_STATUS (Q) são contíguas: lê o bloco inteiro,
-    // aplica as alterações em memória e grava uma vez só. Com centenas de linhas, três
-    // setValue() por item estouraria o tempo de execução do Apps Script.
-    const blocoOQ = dbSheet.getRange(2, STATUS_COL + 1, dados.length, 3).getValues();
+    // Só a coluna AA (CONFERENCIA_SAIDA) muda; o status do item continua o que era.
+    // Lê a coluna inteira, aplica em memória e grava uma vez só (setValue por item estouraria o
+    // tempo de execução do Apps Script com centenas de linhas).
+    const blocoAA = dbSheet.getRange(2, DB_CONFERENCIA_SAIDA_COL + 1, dados.length, 1).getValues();
     selecionadas.forEach(sel => {
-      const i = sel.linha - 2;
-      blocoOQ[i][0] = 'Faturado';
-      blocoOQ[i][1] = '';
-      blocoOQ[i][2] = agora;
-      Logger.log(`📤 Linha ${sel.linha} → Faturado (${sel.motivo}, ID="${sel.id}")`);
+      blocoAA[sel.linha - 2][0] = _textoConferencia_('PENDENTE', 'menu', `${sel.motivo} (menu: sinalizar itens que já saíram da origem)`);
+      Logger.log(`📤 Linha ${sel.linha} → PENDENTE (${sel.motivo}, ID="${sel.id}")`);
     });
-    dbSheet.getRange(2, STATUS_COL + 1, dados.length, 3).setValues(blocoOQ);
+    dbSheet.getRange(2, DB_CONFERENCIA_SAIDA_COL + 1, dados.length, 1).setValues(blocoAA);
 
     SpreadsheetApp.flush();
     limparCache();
     _registrarSentinelaDuplicatas_();
 
-    Logger.log(`✅ faturarItensForaDaFonte: ${selecionadas.length} item(ns) faturado(s).`);
+    Logger.log(`✅ faturarItensForaDaFonte: ${selecionadas.length} item(ns) sinalizado(s) como PENDENTE.`);
     ui.alert('✅ Concluído',
-      `${selecionadas.length} item(ns) marcado(s) como Faturado.\n` +
-      'Detalhes na aba "Itens_Fora_Da_Fonte".\n\n' +
-      `Eles saem do DB automaticamente após ${DIAS_RETENCAO} dias (purga de itens finalizados).`,
+      `${selecionadas.length} item(ns) sinalizado(s) para conferência.\n` +
+      'Eles aparecem no aviso da tela; nenhum foi faturado.\n' +
+      'Detalhes na aba "Itens_Fora_Da_Fonte".',
       ui.ButtonSet.OK);
   } catch (e) {
     Logger.log(`❌ faturarItensForaDaFonte: ${e.message}\n${e.stack}`);
