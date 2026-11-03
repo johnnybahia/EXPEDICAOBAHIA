@@ -121,6 +121,11 @@ const FONTE_SEQ_KEY_COLS = [3, 4, 5, 6, 7, 8, 9, 11, 12, 10];
 // Recebem sequência as OCs INTEIRAS que tenham ao menos 1 item com DT. ENTREGA a partir desta data.
 // A OC toda é numerada (e não só os itens com entrega ≥ corte) para a numeração não ter buracos.
 const SEQUENCIA_ENTREGA_CORTE = new Date(2026, 10, 4); // 04/11/2026
+// Backup da sequência gravado ANTES de todo RESET COMPLETO e restaurado ao final dele (ou pelo menu).
+const BACKUP_SEQ_SHEET_NAME = 'BACKUP_SEQUENCIA';
+const BACKUP_SEQ_HEADERS = ['BACKUP_EM', 'MOTIVO', 'ID_UNICO', 'CODIGO_FIXO', 'OC', 'SEQUENCIA', 'CLIENTE', 'PEDIDO',
+  'DESCRIÇÃO', 'TAMANHO', 'LOTE', 'DATA_RECEB', 'STATUS'];
+const BACKUP_SEQ_MAX_COPIAS = 5; // cópias mais antigas são apagadas
 const DIAS_RETENCAO = 1;       // Idade mínima (dias) para um item Faturado ser purgado.
 // A purga roda em um HORÁRIO FIXO, uma vez por dia — não a toda hora com prazo individual
 // por item. Motivo: o sistema usa etiquetas físicas nos itens; um funcionário precisa de um
@@ -1015,6 +1020,7 @@ function onOpen() {
     .addItem('🔄 Forçar resync agora (aplica correções Dilly)', 'forcarResyncDilly')
     .addSeparator()
     .addItem('🔢 Numerar sequências agora (aba original → PEDIDOS → DB)', 'numerarSequenciasAgora')
+    .addItem('♻️ Restaurar sequência do último backup (após reset)', 'restaurarSequenciaDoBackupMenu')
     .addToUi();
 }
 
@@ -1158,6 +1164,7 @@ function resetarEReprocessar() {
     '2. Apagar os IDs antigos da aba PEDIDOS\n' +
     '3. Regenerar todos os IDs com a nova fórmula\n' +
     '4. Repopular o Relatorio_DB do zero\n\n' +
+    'A sequência dos itens é gravada em ' + BACKUP_SEQ_SHEET_NAME + ' ANTES de apagar e restaurada ao final.\n\n' +
     'Deseja continuar?',
     ui.ButtonSet.YES_NO
   );
@@ -1167,6 +1174,16 @@ function resetarEReprocessar() {
   }
 
   Logger.log('=== RESET COMPLETO INICIADO ===');
+
+  // 0. Backup da sequência. Se não gravar, o reset NÃO prossegue (a sequência não pode ser perdida em silêncio).
+  let backupSeq;
+  try {
+    backupSeq = _salvarBackupSequencia_('RESET COMPLETO');
+  } catch (eBk) {
+    Logger.log(`⛔ Backup da sequência falhou: ${eBk.message} — reset abortado, nada foi apagado.`);
+    ui.alert('⛔ Reset cancelado', `Não foi possível gravar o backup da sequência:\n${eBk.message}\n\nNada foi apagado.`, ui.ButtonSet.OK);
+    return;
+  }
 
   // 1. Limpa Relatorio_DB (mantém cabeçalho na linha 1)
   const dbSheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
@@ -1201,12 +1218,24 @@ function resetarEReprocessar() {
     return;
   }
 
+  // 3.5 Devolve a sequência do backup ao PEDIDOS (col V) antes de popular o DB; o DB (col Y) recebe na propagação.
+  let restauradoSeq = { restaurados: 0, conflitos: 0, ocMudou: 0 };
+  try {
+    restauradoSeq = _restaurarSequenciaDoBackup_();
+  } catch (eRs) {
+    Logger.log(`⚠️ Falha ao restaurar a sequência do backup: ${eRs.message} — use o menu "Restaurar sequência do último backup".`);
+  }
+
   // 4. Roda processo completo (gera IDs faltantes + popula DB)
   Logger.log('🔄 Iniciando processo completo...');
   processoAutomaticoCompleto();
 
   Logger.log('=== RESET COMPLETO FINALIZADO ===');
-  ui.alert('✅ Reset concluído!', 'IDs regenerados e Relatorio_DB repopulado com sucesso.', ui.ButtonSet.OK);
+  ui.alert('✅ Reset concluído!',
+    'IDs regenerados e Relatorio_DB repopulado com sucesso.\n\n' +
+    'Sequência: ' + backupSeq.gravados + ' item(ns) no backup, ' + (restauradoSeq.restaurados || 0) + ' restaurado(s)' +
+    ((restauradoSeq.conflitos || restauradoSeq.ocMudou) ? ` (conflitos: ${restauradoSeq.conflitos || 0}, OC diferente: ${restauradoSeq.ocMudou || 0})` : '') + '.',
+    ui.ButtonSet.OK);
 }
 
 /**
@@ -1216,6 +1245,14 @@ function resetarEReprocessar() {
  */
 function resetarEReprocessarSilencioso() {
   Logger.log('=== RESET COMPLETO INICIADO (modo silencioso) ===');
+
+  // 0. Backup da sequência. Se não gravar, o reset NÃO prossegue (a sequência não pode ser perdida em silêncio).
+  try {
+    _salvarBackupSequencia_('RESET COMPLETO (silencioso)');
+  } catch (eBk) {
+    Logger.log(`⛔ Backup da sequência falhou: ${eBk.message} — reset abortado, nada foi apagado.`);
+    return;
+  }
 
   // 1. Limpa Relatorio_DB (mantém cabeçalho na linha 1)
   const dbSheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
@@ -1247,6 +1284,13 @@ function resetarEReprocessarSilencioso() {
   if (resyncReset && resyncReset.erro) {
     Logger.log(`⚠️ Falha ao reconstruir PEDIDOS: ${resyncReset.erro} — reset interrompido`);
     return;
+  }
+
+  // 3.5 Devolve a sequência do backup ao PEDIDOS (col V); o DB (col Y) recebe na propagação
+  try {
+    _restaurarSequenciaDoBackup_();
+  } catch (eRs) {
+    Logger.log(`⚠️ Falha ao restaurar a sequência do backup: ${eRs.message}`);
   }
 
   // 4. Roda processo completo (gera IDs faltantes + popula DB)
@@ -2418,6 +2462,176 @@ function _ocsElegiveisSequencia_(rows, colCartela, colOc, colEntrega) {
     if (entregaMs !== null && entregaMs >= corte) ocs.add(oc);
   });
   return ocs;
+}
+
+// ====== BACKUP / RESTAURAÇÃO DA SEQUÊNCIA (proteção do RESET COMPLETO) ======
+
+// Sequência numérica válida (> 0) de uma célula, ou 0.
+function _seqNum_(v) {
+  const n = (typeof v === 'number') ? v : Number(String(v === null || v === undefined ? '' : v).trim() || NaN);
+  return (isFinite(n) && n > 0) ? n : 0;
+}
+
+// Identidade de um item SEM depender do ID nem do UUID: OC|pedido|produto|tamanho|lote|data de recebimento.
+function _chaveItemSeq_(oc, pedido, desc, tam, lote, dtrec) {
+  return [oc, pedido, _descBase_(desc), tam, lote, dtrec].map(_normSeqVal_).join('|');
+}
+
+/**
+ * Grava, na aba BACKUP_SEQUENCIA, a sequência de todos os itens do Relatorio_DB que têm número.
+ * Cada cópia leva o mesmo rótulo BACKUP_EM; ficam as últimas BACKUP_SEQ_MAX_COPIAS. Nunca grava cópia vazia.
+ * @returns {{gravados:number}} (lança erro se não conseguir gravar — o reset deve ser abortado)
+ */
+function _salvarBackupSequencia_(motivo) {
+  const ss = getSpreadsheet_();
+  const db = ss.getSheetByName(DB_SHEET_NAME);
+  if (!db || db.getLastRow() < 2) return { gravados: 0 };
+
+  const ncols = Math.min(DB_SEQUENCIA_COL + 1, db.getMaxColumns());
+  const dados = db.getRange(2, 1, db.getLastRow() - 1, ncols).getValues();
+  const rotulo = _formatarDataRapido_(new Date(), 'dd/MM/yyyy HH:mm:ss');
+  const linhas = [];
+  dados.forEach(r => {
+    const id = String(r[0] || '').trim();
+    const seq = _seqNum_(r[DB_SEQUENCIA_COL]);
+    if (!id || !seq) return;
+    const dtrec = r[11] instanceof Date ? _formatarDataRapido_(r[11], 'dd/MM/yyyy') : String(r[11] || '').trim();
+    linhas.push([rotulo, motivo || '', id, String(r[DB_CODIGO_FIXO_COL] || '').trim(), String(r[DB_OC_COL] || '').trim(), seq,
+      String(r[2] || '').trim(), String(r[DB_PEDIDO_COL] || '').trim(), _descBase_(r[DB_DESC_COL]), String(r[DB_TAM_COL] || '').trim(),
+      String(r[DB_LOTE_COL] || '').trim(), dtrec, String(r[STATUS_COL] || '').trim()]);
+  });
+  if (linhas.length === 0) {
+    Logger.log('ℹ️ Backup da sequência: nenhum item numerado no DB — nada a gravar.');
+    return { gravados: 0 };
+  }
+
+  let sh = ss.getSheetByName(BACKUP_SEQ_SHEET_NAME);
+  if (!sh) {
+    sh = ss.insertSheet(BACKUP_SEQ_SHEET_NAME);
+    try { sh.protect().setDescription('Backup da sequência — não editar').setWarningOnly(true); } catch (e) { /* proteção é opcional */ }
+  }
+  if (sh.getLastRow() < 1) {
+    sh.getRange(1, 1, 1, BACKUP_SEQ_HEADERS.length).setValues([BACKUP_SEQ_HEADERS]).setFontWeight('bold');
+  }
+  const inicio = sh.getLastRow() + 1;
+  // texto puro, para a planilha não converter datas/lotes/OCs ao regravar (SEQUENCIA, col 6, fica numérica)
+  sh.getRange(inicio, 1, linhas.length, 5).setNumberFormat('@');
+  sh.getRange(inicio, 7, linhas.length, BACKUP_SEQ_HEADERS.length - 6).setNumberFormat('@');
+  sh.getRange(inicio, 1, linhas.length, BACKUP_SEQ_HEADERS.length).setValues(linhas);
+  SpreadsheetApp.flush();
+
+  // Mantém só as últimas cópias (as linhas de uma cópia são contíguas e ordenadas por data)
+  const rotulos = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().map(x => String(x[0]));
+  const distintos = [];
+  rotulos.forEach(x => { if (distintos[distintos.length - 1] !== x) distintos.push(x); });
+  if (distintos.length > BACKUP_SEQ_MAX_COPIAS) {
+    const apagar = new Set(distintos.slice(0, distintos.length - BACKUP_SEQ_MAX_COPIAS));
+    let n = 0;
+    while (n < rotulos.length && apagar.has(rotulos[n])) n++;
+    if (n > 0) sh.deleteRows(2, n);
+  }
+  Logger.log(`💾 Backup da sequência: ${linhas.length} item(ns) gravado(s) em ${BACKUP_SEQ_SHEET_NAME} (${rotulo}).`);
+  return { gravados: linhas.length };
+}
+
+/**
+ * Devolve ao PEDIDOS (col V) a sequência guardada no backup, SOMENTE em células vazias, casando cada item por
+ * CODIGO_FIXO (UUID) ou, na falta, por OC|pedido|produto|tamanho|lote|data. A coluna Y do DB é preenchida na
+ * sequência pelo processoAutomaticoCompleto (propagação PEDIDOS → DB). Cópias mais novas prevalecem.
+ * Nunca sobrescreve número existente; conflito (OC|número já usado por outro item) é pulado e contado.
+ */
+function _restaurarSequenciaDoBackup_() {
+  const res = { restaurados: 0, jaTinham: 0, conflitos: 0, ocMudou: 0, semBackup: false, erro: '' };
+  const ss = getSpreadsheet_();
+  const bk = ss.getSheetByName(BACKUP_SEQ_SHEET_NAME);
+  if (!bk || bk.getLastRow() < 2) { res.semBackup = true; return res; }
+  const ped = ss.getSheetByName(FONTE_SHEET_NAME);
+  if (!ped || ped.getLastRow() < FONTE_DATA_START_ROW) return res;
+
+  const lock = LockService.getScriptLock();
+  try { lock.waitLock(30000); } catch (e) { res.erro = 'outra execução em andamento'; return res; }
+  try {
+    // Backup: do mais antigo ao mais novo; a cópia mais nova prevalece
+    const entradas = new Map(); // "oc|seq" → entrada
+    bk.getRange(2, 1, bk.getLastRow() - 1, BACKUP_SEQ_HEADERS.length).getValues().forEach(r => {
+      const oc = _normSeqVal_(r[4]), seq = _seqNum_(r[5]);
+      if (!oc || !seq) return;
+      entradas.set(`${oc}|${seq}`, {
+        oc, seq, uuid: String(r[3] || '').trim(),
+        chave: _chaveItemSeq_(r[4], r[7], r[8], r[9], r[10], r[11])
+      });
+    });
+    const porUuid = new Map(), porChave = new Map();
+    [...entradas.values()].sort((a, b) => a.seq - b.seq).forEach(e => {
+      if (e.uuid) porUuid.set(e.uuid, e);
+      if (!porChave.has(e.chave)) porChave.set(e.chave, []);
+      porChave.get(e.chave).push(e);
+    });
+
+    const n = ped.getLastRow() - FONTE_DATA_START_ROW + 1;
+    const ncols = Math.max(PEDIDOS_SEQ_ORIGINAL_COL + 1, ped.getLastColumn());
+    const rows = ped.getRange(FONTE_DATA_START_ROW, 1, n, ncols).getValues();
+    const colV = rows.map(r => [r[PEDIDOS_SEQ_ORIGINAL_COL]]);
+    const usados = new Set();
+    const consumidas = new Set();
+    const temItem = r => String(r[CARTELA_COL] || '').trim() !== '';
+    rows.forEach(r => { const s = _seqNum_(r[PEDIDOS_SEQ_ORIGINAL_COL]); if (s && temItem(r)) usados.add(`${_normSeqVal_(r[OC_COL])}|${s}`); });
+
+    const aplicar = (i, e) => {
+      const oc = _normSeqVal_(rows[i][OC_COL]);
+      if (oc !== e.oc) { res.ocMudou++; return false; }
+      if (usados.has(`${oc}|${e.seq}`)) { res.conflitos++; return false; }
+      colV[i][0] = e.seq;
+      usados.add(`${oc}|${e.seq}`);
+      consumidas.add(`${e.oc}|${e.seq}`);
+      res.restaurados++;
+      return true;
+    };
+    const pendentes = [];
+    rows.forEach((r, i) => {
+      if (!temItem(r)) return;
+      if (_seqNum_(r[PEDIDOS_SEQ_ORIGINAL_COL])) { res.jaTinham++; return; }
+      const e = porUuid.get(String(r[PEDIDOS_CODIGO_FIXO_COL] || '').trim());
+      if (e && !consumidas.has(`${e.oc}|${e.seq}`) && aplicar(i, e)) return;
+      pendentes.push(i);
+    });
+    // Sem UUID (ou UUID não casou): identidade por OC|pedido|produto|tamanho|lote|data, na ordem do número
+    pendentes.forEach(i => {
+      const r = rows[i];
+      const lista = porChave.get(_chaveItemSeq_(r[OC_COL], r[PEDIDO_COL], r[DESC_COL], r[TAM_COL], r[PEDIDOS_LOTE_COL], r[DTREC_COL]));
+      const e = lista && lista.find(x => !consumidas.has(`${x.oc}|${x.seq}`) && !usados.has(`${x.oc}|${x.seq}`));
+      if (e) aplicar(i, e);
+    });
+
+    if (res.restaurados > 0) {
+      ped.getRange(FONTE_DATA_START_ROW, PEDIDOS_SEQ_ORIGINAL_COL + 1, n, 1).setValues(colV);
+      SpreadsheetApp.flush();
+    }
+    Logger.log(`♻️ Sequência restaurada do backup: ${res.restaurados} item(ns) | já tinham: ${res.jaTinham} | conflitos: ${res.conflitos} | OC mudou: ${res.ocMudou}`);
+  } finally {
+    lock.releaseLock();
+  }
+  return res;
+}
+
+/** Menu: devolve a sequência do backup (PEDIDOS col V → DB col Y) para os itens ainda sem número. */
+function restaurarSequenciaDoBackupMenu() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    if (_sistemaPausado_()) {
+      ui.alert('⏸ Sistema pausado', 'Retome o sistema pelo menu antes de restaurar.', ui.ButtonSet.OK);
+      return;
+    }
+    const r = _restaurarSequenciaDoBackup_();
+    if (r.erro) { ui.alert('Não foi possível restaurar', r.erro + '. Tente de novo em 1 minuto.', ui.ButtonSet.OK); return; }
+    if (r.semBackup) { ui.alert('Sem backup', 'A aba ' + BACKUP_SEQ_SHEET_NAME + ' não existe ou está vazia.', ui.ButtonSet.OK); return; }
+    processoAutomaticoCompleto(); // propaga PEDIDOS (col V) → Relatorio_DB (col Y)
+    ui.alert('♻️ Sequência restaurada',
+      'Restaurados: ' + r.restaurados + '\nJá tinham número: ' + r.jaTinham +
+      '\nConflitos (número já usado na OC): ' + r.conflitos + '\nOC diferente da do backup: ' + r.ocMudou, ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('Erro', e.message, ui.ButtonSet.OK);
+  }
 }
 
 // Converte DATA RECEB. (Date, 'dd/MM/yyyy' ou 'yyyy-MM-dd') para ms à meia-noite local.

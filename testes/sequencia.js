@@ -200,4 +200,122 @@ t('sem a aba "original" a função avisa e não altera nada', () => {
   assert.strictEqual(JSON.stringify(e.ss.getSheetByName('Relatorio_DB').data), antesDB);
 });
 
+// ── RESET COMPLETO: backup antes, restauração depois ──────────────────────────────────────────────────────
+function uiGravando(msgs) {
+  return { alert: (t, m) => { msgs.push([String(t), String(m || '')]); return 'YES'; }, ButtonSet: { OK: 'OK', YES_NO: 'YES_NO' }, Button: { YES: 'YES' } };
+}
+/** Env numerado (original em ordem invertida) e utilitários para faturar/atualizar. */
+function envNumerado() {
+  const e = montarEnv();
+  const msgs = [];
+  e.ctx.SpreadsheetApp.getUi = () => uiGravando(msgs);
+  const refazOriginal = () => { e.ss.sheets.delete('original'); criarOriginal(e, (l) => [...l].reverse()); };
+  refazOriginal();
+  e.ctx.numerarSequenciasAgora();
+  let ts = 0;
+  const importa = () => {
+    const imp = e.ss.getSheetByName('DADOS_IMPORTADOS');
+    imp.getRange('H2').setValue(`03/11/2026 11:${String(++ts).padStart(2, '0')}:00`);
+    e.props.set('ULTIMO_TOTAL_FONTE', String(imp.data.slice(3).filter(r => String(r[1] || '').trim()).length));
+  };
+  return { e, msgs, refazOriginal, importa };
+}
+const porItem = (e) => Object.fromEntries(linhasDB(e).map(r => [`${r['ORD. COMPRA']}|${descBase(r)}|${r.TAMANHO}|${r.LOTE}|${r.ID_UNICO}`, seqDe(r)]));
+const porDesc = (e, oc) => Object.fromEntries(linhasDB(e).filter(r => String(r['ORD. COMPRA']) === oc).map(r => [`${descBase(r)}`, seqDe(r)]));
+
+t('RESET COMPLETO com itens já faturados e a "original" encolhida: os itens abertos mantêm a sequência', () => {
+  const { e, msgs, refazOriginal, importa } = envNumerado();
+  const antes = porDesc(e, OC_DEPOIS), antesMista = porDesc(e, OC_MISTA);
+  assert.deepStrictEqual(Object.values(antes).map(Number).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  // itens 7..12 faturados: saem da fonte; a "original" encolhe
+  const imp = e.ss.getSheetByName('DADOS_IMPORTADOS');
+  const faturados = Object.keys(antes).filter(k => Number(antes[k]) >= 7);
+  faturados.forEach(alvo => { const i = imp.data.findIndex((r, ix) => ix >= 3 && String(r[9]) === OC_DEPOIS && String(r[7]) === alvo); imp.data.splice(i, 1); });
+  refazOriginal(); importa(); e.ctx.processoAutomaticoCompleto();
+  e.ctx.resetarEReprocessar();                       // diálogo responde SIM
+  const dep = porDesc(e, OC_DEPOIS);
+  assert.strictEqual(Object.keys(dep).length, 6, 'sobram os 6 itens abertos');
+  Object.keys(dep).forEach(k => assert.strictEqual(dep[k], antes[k], `${k}: ${antes[k]} → ${dep[k]}`));
+  assert.deepStrictEqual(porDesc(e, OC_MISTA), antesMista, 'outra OC não pode mudar');
+  const colV = e.ss.getSheetByName('PEDIDOS').data.slice(3).filter(r => String(r[9]) === OC_DEPOIS).map(r => Number(r[21])).sort((a, b) => a - b);
+  assert.deepStrictEqual(colV, [1, 2, 3, 4, 5, 6], 'PEDIDOS (col V) também restaurado');
+  assert.match(msgs[msgs.length - 1][1], /restaurado/);
+  assert.ok(e.ss.getSheetByName('BACKUP_SEQUENCIA'), 'aba de backup criada');
+});
+t('o backup guarda ID, UUID, OC, número, produto e status, e só dos itens numerados', () => {
+  const { e } = envNumerado();
+  const n = linhasDB(e).filter(r => seqDe(r)).length;
+  e.ctx.resetarEReprocessar();
+  const bk = e.ss.getSheetByName('BACKUP_SEQUENCIA');
+  assert.deepStrictEqual(bk.data[0], ['BACKUP_EM', 'MOTIVO', 'ID_UNICO', 'CODIGO_FIXO', 'OC', 'SEQUENCIA', 'CLIENTE', 'PEDIDO', 'DESCRIÇÃO', 'TAMANHO', 'LOTE', 'DATA_RECEB', 'STATUS']);
+  const linhas = bk.data.slice(1).filter(r => r[2]);
+  assert.strictEqual(linhas.length, n);
+  assert.ok(linhas.every(r => r[3] && r[4] && Number(r[5]) > 0 && r[8] && !/\[[0-9a-f-]{36}\]/.test(r[8])));
+});
+t('sem item numerado não grava cópia vazia (nem cria a aba)', () => {
+  const e = montarEnv();
+  e.ctx.resetarEReprocessar();
+  assert.strictEqual(e.ss.getSheetByName('BACKUP_SEQUENCIA'), null);
+});
+t('restauração por identidade (OC|pedido|produto|tamanho|lote|data) quando o UUID do backup não casa', () => {
+  const { e } = envNumerado();
+  const antes = porDesc(e, OC_DEPOIS);
+  e.ctx.resetarEReprocessar();
+  const bk = e.ss.getSheetByName('BACKUP_SEQUENCIA');
+  bk.data.slice(1).forEach(r => { if (r[3]) r[3] = 'uuid-que-nao-existe'; });   // UUID do backup deixa de casar
+  e.ss.getSheetByName('PEDIDOS').data.slice(3).forEach(r => { r[21] = ''; });     // e a sequência some do PEDIDOS
+  e.ss.getSheetByName('Relatorio_DB').data.forEach((r, i) => { if (i > 0) r[24] = ''; });
+  e.ctx.restaurarSequenciaDoBackupMenu();
+  assert.deepStrictEqual(porDesc(e, OC_DEPOIS), antes);
+});
+t('menu "Restaurar sequência": devolve ao PEDIDOS e ao DB, sem sobrescrever número existente', () => {
+  const { e } = envNumerado();
+  const antes = porDesc(e, OC_DEPOIS);
+  e.ctx.resetarEReprocessar();
+  const db = e.ss.getSheetByName('Relatorio_DB');
+  const ped = e.ss.getSheetByName('PEDIDOS');
+  db.data.forEach((r, i) => { if (i > 0 && String(r[8]) === OC_DEPOIS) r[24] = ''; });
+  ped.data.slice(3).forEach(r => { if (String(r[9]) === OC_DEPOIS) r[21] = ''; });
+  const umaOutra = ped.data.slice(3).find(r => String(r[9]) === OC_MISTA);
+  const doBackup = umaOutra[21];
+  assert.ok(Number(doBackup) > 0 && Number(doBackup) !== 777);
+  umaOutra[21] = 777;                                    // número que já existe no PEDIDOS (≠ backup): não pode ser tocado
+  e.ctx.restaurarSequenciaDoBackupMenu();
+  assert.deepStrictEqual(porDesc(e, OC_DEPOIS), antes);
+  assert.strictEqual(Number(umaOutra[21]), 777, 'número existente não pode ser sobrescrito pela restauração');
+});
+t('conflito: backup pede número já usado por outro item da OC → não restaura (nunca repete número)', () => {
+  const { e } = envNumerado();
+  e.ctx.resetarEReprocessar();
+  const ped = e.ss.getSheetByName('PEDIDOS');
+  const doOc = ped.data.slice(3).filter(r => String(r[9]) === OC_DEPOIS);
+  const [a, b] = doOc;
+  const seqA = Number(a[21]);
+  b[21] = '';                                            // b perde o número; o backup dele agora "pede" o número de a
+  const bk = e.ss.getSheetByName('BACKUP_SEQUENCIA');
+  bk.data.slice(1).forEach(r => { if (String(r[3]) === String(b[18])) r[5] = seqA; });
+  e.ctx._restaurarSequenciaDoBackup_();
+  const nums = ped.data.slice(3).filter(r => String(r[9]) === OC_DEPOIS).map(r => Number(r[21])).filter(Boolean);
+  assert.strictEqual(new Set(nums).size, nums.length, 'número repetido na OC');
+  assert.strictEqual(String(b[21]), '', 'o item em conflito fica sem número');
+});
+t('mantém só as últimas 5 cópias do backup', () => {
+  const { e } = envNumerado();
+  const orig = e.ctx._formatarDataRapido_;
+  let n = 0;
+  e.ctx._formatarDataRapido_ = (d, p) => (p === 'dd/MM/yyyy HH:mm:ss' ? `cópia ${String(++n).padStart(2, '0')}` : orig(d, p));
+  for (let i = 0; i < 8; i++) e.ctx._salvarBackupSequencia_('teste');
+  e.ctx._formatarDataRapido_ = orig;
+  const rotulos = [...new Set(e.ss.getSheetByName('BACKUP_SEQUENCIA').data.slice(1).filter(r => r[0]).map(r => r[0]))];
+  assert.deepStrictEqual(rotulos, ['cópia 04', 'cópia 05', 'cópia 06', 'cópia 07', 'cópia 08']);
+});
+t('se o backup não puder ser gravado, o reset é cancelado e NADA é apagado', () => {
+  const { e, msgs } = envNumerado();
+  const antes = JSON.stringify(e.ss.getSheetByName('Relatorio_DB').data);
+  e.ctx._salvarBackupSequencia_ = () => { throw new Error('sem espaço'); };
+  e.ctx.resetarEReprocessar();
+  assert.strictEqual(JSON.stringify(e.ss.getSheetByName('Relatorio_DB').data), antes, 'DB foi alterado');
+  assert.match(msgs[msgs.length - 1][0], /Reset cancelado/);
+});
+
 R.fim();
