@@ -239,7 +239,7 @@ t('RESET COMPLETO com itens já faturados e a "original" encolhida: os itens abe
   assert.deepStrictEqual(porDesc(e, OC_MISTA), antesMista, 'outra OC não pode mudar');
   const colV = e.ss.getSheetByName('PEDIDOS').data.slice(3).filter(r => String(r[9]) === OC_DEPOIS).map(r => Number(r[21])).sort((a, b) => a - b);
   assert.deepStrictEqual(colV, [1, 2, 3, 4, 5, 6], 'PEDIDOS (col V) também restaurado');
-  assert.match(msgs[msgs.length - 1][1], /restaurado/);
+  assert.match(msgs[msgs.length - 1][1], /Depois do reset, 6 de 6 item\(ns\) das OCs elegíveis|Depois do reset, \d+ de \d+ item/);
   assert.ok(e.ss.getSheetByName('BACKUP_SEQUENCIA'), 'aba de backup criada');
 });
 t('o backup guarda ID, UUID, OC, número, produto e status, e só dos itens numerados', () => {
@@ -308,6 +308,70 @@ t('mantém só as últimas 5 cópias do backup', () => {
   e.ctx._formatarDataRapido_ = orig;
   const rotulos = [...new Set(e.ss.getSheetByName('BACKUP_SEQUENCIA').data.slice(1).filter(r => r[0]).map(r => r[0]))];
   assert.deepStrictEqual(rotulos, ['cópia 04', 'cópia 05', 'cópia 06', 'cópia 07', 'cópia 08']);
+});
+/** Fatura (remove da fonte) os itens da OC_DEPOIS com número <= corte e encolhe a "original": as posições dos que ficam deslocam. */
+function faturarPrimeiros(ctxEnv, corte) {
+  const { e, refazOriginal, importa } = ctxEnv;
+  const antes = porDesc(e, OC_DEPOIS);
+  const imp = e.ss.getSheetByName('DADOS_IMPORTADOS');
+  Object.keys(antes).filter(k => Number(antes[k]) <= corte).forEach(alvo => {
+    const i = imp.data.findIndex((r, ix) => ix >= 3 && String(r[9]) === OC_DEPOIS && String(r[7]) === alvo);
+    imp.data.splice(i, 1);
+  });
+  refazOriginal(); importa(); e.ctx.processoAutomaticoCompleto();
+  return Object.fromEntries(Object.entries(antes).filter(([, v]) => Number(v) > corte));
+}
+t('RESET COMPLETO quando os PRIMEIROS itens foram faturados (posições da "original" deslocam): ninguém é renumerado', () => {
+  const amb = envNumerado();
+  const restantes = faturarPrimeiros(amb, 3);                 // 4..12 ficam; na "original" encolhida viram as posições 1..9
+  assert.strictEqual(Object.keys(restantes).length, 9);
+  amb.e.ctx.resetarEReprocessar();
+  assert.deepStrictEqual(porDesc(amb.e, OC_DEPOIS), restantes);
+});
+t('RESET sem backup disponível: o item herda o número da própria linha do PEDIDOS (não deriva da "original" encolhida)', () => {
+  const amb = envNumerado();
+  const restantes = faturarPrimeiros(amb, 3);
+  amb.e.ctx._salvarBackupSequencia_ = () => ({ gravados: 0 });  // nenhum backup é gravado
+  amb.e.ctx.resetarEReprocessar();
+  assert.strictEqual(amb.e.ss.getSheetByName('BACKUP_SEQUENCIA'), null);
+  assert.deepStrictEqual(porDesc(amb.e, OC_DEPOIS), restantes);
+});
+t('pior caso: PEDIDOS e DB apagados (UUIDs perdidos) depois de faturar os primeiros: o backup devolve os mesmos números', () => {
+  const amb = envNumerado();
+  const restantes = faturarPrimeiros(amb, 3);
+  const { e, importa } = amb;
+  e.ctx._salvarBackupSequencia_('antes do desastre');
+  const ped = e.ss.getSheetByName('PEDIDOS'); ped.data = ped.data.slice(0, 3);   // PEDIDOS inteiro some (inclusive UUIDs)
+  const db = e.ss.getSheetByName('Relatorio_DB'); db.data = [db.data[0]];        // DB some
+  importa(); e.ctx.sincronizarPedidosComFonte(true);
+  const v = e.ss.getSheetByName('PEDIDOS').data.slice(3).filter(r => String(r[9]) === OC_DEPOIS).map(r => Number(r[21])).sort((a, b) => a - b);
+  assert.deepStrictEqual(v, [4, 5, 6, 7, 8, 9, 10, 11, 12], 'o sync já deve devolver o número do backup, não derivar da "original" encolhida');
+  e.ctx.restaurarSequenciaDoBackupMenu();
+  assert.deepStrictEqual(porDesc(e, OC_DEPOIS), restantes);
+});
+t('sem backup, o que não é do backup continua sendo derivado da "original" (item novo em OC nova)', () => {
+  const amb = envNumerado();
+  amb.e.ctx.resetarEReprocessar();                              // cria o backup
+  const imp = amb.e.ss.getSheetByName('DADOS_IMPORTADOS');
+  const molde = imp.data.slice(3).find(r => String(r[9]) === OC_DEPOIS);
+  for (let k = 1; k <= 3; k++) { const n = [...molde]; n[9] = '16888000'; n[7] = `ELAST. NOVO${k} COR ${k}`; n[8] = `${60 + k}CM`; n[12] = `OS-NOVO-${k}`; imp.data.push(n); }
+  amb.refazOriginal(); amb.importa(); amb.e.ctx.processoAutomaticoCompleto();
+  const novos = seqDB(amb.e, '16888000').map(r => Number(seqDe(r))).sort((a, b) => a - b);
+  assert.deepStrictEqual(novos, [1, 2, 3]);
+});
+
+t('RESET: OC cujos itens com entrega >= corte foram todos faturados mantém o número dos itens antigos que ficaram abertos', () => {
+  const amb = envNumerado();
+  const antes = porDesc(amb.e, OC_MISTA);                       // 12 numerados; só "M1000" tem entrega antes do corte
+  const antigo = Object.keys(antes).find(k => /M1000 /.test(k));
+  const imp = amb.e.ss.getSheetByName('DADOS_IMPORTADOS');
+  imp.data = imp.data.filter((r, i) => i < 3 || String(r[9]) !== OC_MISTA || String(r[7]) === antigo);   // os outros 11 foram faturados
+  amb.refazOriginal(); amb.importa(); amb.e.ctx.processoAutomaticoCompleto();
+  assert.ok(Number(porDesc(amb.e, OC_MISTA)[antigo]) > 0, 'antes do reset o item tem número no DB');
+  amb.e.ctx.resetarEReprocessar();
+  const depois = porDesc(amb.e, OC_MISTA);
+  assert.deepStrictEqual(Object.keys(depois), [antigo]);
+  assert.strictEqual(depois[antigo], antes[antigo], 'o item antigo, ainda aberto, perdeu o número no relatório');
 });
 t('se o backup não puder ser gravado, o reset é cancelado e NADA é apagado', () => {
   const { e, msgs } = envNumerado();

@@ -126,6 +126,10 @@ const BACKUP_SEQ_SHEET_NAME = 'BACKUP_SEQUENCIA';
 const BACKUP_SEQ_HEADERS = ['BACKUP_EM', 'MOTIVO', 'ID_UNICO', 'CODIGO_FIXO', 'OC', 'SEQUENCIA', 'CLIENTE', 'PEDIDO',
   'DESCRIÇÃO', 'TAMANHO', 'LOTE', 'DATA_RECEB', 'STATUS'];
 const BACKUP_SEQ_MAX_COPIAS = 5; // cópias mais antigas são apagadas
+// OCs que já tinham sequência e devem continuar elegíveis MESMO que a data não as qualifique mais (todos os itens com
+// entrega >= corte já faturados e só itens antigos abertos). Preenchida SÓ durante o RESET / a restauração (mesma
+// execução): o DB é apagado no reset e, sem isso, esses itens perderiam o número no relatório. null = nada a preservar.
+let _OCS_SEQ_PRESERVAR_ = null;
 const DIAS_RETENCAO = 1;       // Idade mínima (dias) para um item Faturado ser purgado.
 // A purga roda em um HORÁRIO FIXO, uma vez por dia — não a toda hora com prazo individual
 // por item. Motivo: o sistema usa etiquetas físicas nos itens; um funcionário precisa de um
@@ -1179,6 +1183,7 @@ function resetarEReprocessar() {
   let backupSeq;
   try {
     backupSeq = _salvarBackupSequencia_('RESET COMPLETO');
+    _OCS_SEQ_PRESERVAR_ = new Set(backupSeq.ocs);
   } catch (eBk) {
     Logger.log(`⛔ Backup da sequência falhou: ${eBk.message} — reset abortado, nada foi apagado.`);
     ui.alert('⛔ Reset cancelado', `Não foi possível gravar o backup da sequência:\n${eBk.message}\n\nNada foi apagado.`, ui.ButtonSet.OK);
@@ -1214,28 +1219,34 @@ function resetarEReprocessar() {
   const resyncReset = sincronizarPedidosComFonte(true);
   if (resyncReset && resyncReset.erro) {
     Logger.log(`⚠️ Falha ao reconstruir PEDIDOS: ${resyncReset.erro} — reset interrompido`);
+    _OCS_SEQ_PRESERVAR_ = null;
     ui.alert('⚠️ Reset interrompido', `Não foi possível reconstruir a aba PEDIDOS:\n${resyncReset.erro}`, ui.ButtonSet.OK);
     return;
   }
 
-  // 3.5 Devolve a sequência do backup ao PEDIDOS (col V) antes de popular o DB; o DB (col Y) recebe na propagação.
-  let restauradoSeq = { restaurados: 0, conflitos: 0, ocMudou: 0 };
+  // 4. Roda processo completo (gera IDs faltantes + popula DB). A sequência volta aqui: o sync (passo 3) mantém o
+  // número da linha de PEDIDOS que casa com o item e, na falta dele, consulta o BACKUP_SEQUENCIA ANTES de derivar
+  // da aba "original" (que encolhe quando itens são faturados); a propagação grava a col Y do DB.
+  Logger.log('🔄 Iniciando processo completo...');
   try {
-    restauradoSeq = _restaurarSequenciaDoBackup_();
-  } catch (eRs) {
-    Logger.log(`⚠️ Falha ao restaurar a sequência do backup: ${eRs.message} — use o menu "Restaurar sequência do último backup".`);
+    processoAutomaticoCompleto();
+  } finally {
+    _OCS_SEQ_PRESERVAR_ = null;
   }
 
-  // 4. Roda processo completo (gera IDs faltantes + popula DB)
-  Logger.log('🔄 Iniciando processo completo...');
-  processoAutomaticoCompleto();
-
   Logger.log('=== RESET COMPLETO FINALIZADO ===');
-  ui.alert('✅ Reset concluído!',
-    'IDs regenerados e Relatorio_DB repopulado com sucesso.\n\n' +
-    'Sequência: ' + backupSeq.gravados + ' item(ns) no backup, ' + (restauradoSeq.restaurados || 0) + ' restaurado(s)' +
-    ((restauradoSeq.conflitos || restauradoSeq.ocMudou) ? ` (conflitos: ${restauradoSeq.conflitos || 0}, OC diferente: ${restauradoSeq.ocMudou || 0})` : '') + '.',
-    ui.ButtonSet.OK);
+  // Resultado real, lido da planilha depois do reset (e não só o que a restauração devolveu)
+  let diagSeq = null;
+  try { diagSeq = _diagnosticoSequencias_(); } catch (eDg) { Logger.log(`⚠️ Diagnóstico da sequência falhou: ${eDg.message}`); }
+  let linhaSeq = `Sequência: backup de ${backupSeq.gravados} item(ns) gravado em ${BACKUP_SEQ_SHEET_NAME} antes do reset.`;
+  if (diagSeq) {
+    linhaSeq += `\nDepois do reset, ${diagSeq.numeradosDB} de ${diagSeq.itens} item(ns) das OCs elegíveis estão numerados no Relatorio_DB.`;
+    if (diagSeq.semNumero > 0) {
+      linhaSeq += `\n⚠️ ${diagSeq.semNumero} item(ns) SEM número (não estão na aba "${ORIGINAL_SHEET_NAME}" nem no backup). ` +
+        'Veja os exemplos em "🔢 Numerar sequências agora" ou use "♻️ Restaurar sequência do último backup".';
+    }
+  }
+  ui.alert('✅ Reset concluído!', 'IDs regenerados e Relatorio_DB repopulado com sucesso.\n\n' + linhaSeq, ui.ButtonSet.OK);
 }
 
 /**
@@ -1248,7 +1259,7 @@ function resetarEReprocessarSilencioso() {
 
   // 0. Backup da sequência. Se não gravar, o reset NÃO prossegue (a sequência não pode ser perdida em silêncio).
   try {
-    _salvarBackupSequencia_('RESET COMPLETO (silencioso)');
+    _OCS_SEQ_PRESERVAR_ = new Set(_salvarBackupSequencia_('RESET COMPLETO (silencioso)').ocs);
   } catch (eBk) {
     Logger.log(`⛔ Backup da sequência falhou: ${eBk.message} — reset abortado, nada foi apagado.`);
     return;
@@ -1283,19 +1294,18 @@ function resetarEReprocessarSilencioso() {
   const resyncReset = sincronizarPedidosComFonte(true);
   if (resyncReset && resyncReset.erro) {
     Logger.log(`⚠️ Falha ao reconstruir PEDIDOS: ${resyncReset.erro} — reset interrompido`);
+    _OCS_SEQ_PRESERVAR_ = null;
     return;
   }
 
-  // 3.5 Devolve a sequência do backup ao PEDIDOS (col V); o DB (col Y) recebe na propagação
-  try {
-    _restaurarSequenciaDoBackup_();
-  } catch (eRs) {
-    Logger.log(`⚠️ Falha ao restaurar a sequência do backup: ${eRs.message}`);
-  }
-
-  // 4. Roda processo completo (gera IDs faltantes + popula DB)
+  // 4. Roda processo completo (gera IDs faltantes + popula DB). A sequência volta pelo sync (número da linha
+  // casada de PEDIDOS ou BACKUP_SEQUENCIA, antes de derivar da aba "original").
   Logger.log('🔄 Iniciando processo completo...');
-  processoAutomaticoCompleto();
+  try {
+    processoAutomaticoCompleto();
+  } finally {
+    _OCS_SEQ_PRESERVAR_ = null;
+  }
 
   Logger.log('=== RESET COMPLETO FINALIZADO ===');
 }
@@ -1786,8 +1796,18 @@ function sincronizarPedidosComFonte(forcarExecucao) {
 
     // OCs que recebem sequência: ao menos 1 item com DT. ENTREGA ≥ SEQUENCIA_ENTREGA_CORTE.
     // fonteRow (a partir da col B): CARTELA=0, ORD. COMPRA=8, DT. ENTREGA=13.
-    const ocsElegiveisSeq = _ocsElegiveisSequencia_(fonteData, 0, 8, 13);
+    const ocsElegiveisSeq = _somarOcsPreservadas_(_ocsElegiveisSequencia_(fonteData, 0, 8, 13));
     let itensElegiveisSemSeq = 0; // itens de OC elegível que a aba "original" não numerou
+    let sequenciasDoBackup = 0;   // itens que receberam o número do BACKUP_SEQUENCIA (reset / perda)
+    // Backup lido sob demanda: no máximo 1 vez por sync, e só se algum item elegível chegar aqui sem número
+    let _mapaBackupSeq_;
+    const _backupSeq_ = () => {
+      if (_mapaBackupSeq_ === undefined) {
+        try { _mapaBackupSeq_ = _carregarMapaBackupSequencia_(); }
+        catch (eBk) { _mapaBackupSeq_ = null; Logger.log(`⚠️ Backup da sequência ilegível (${eBk.message}) — seguindo sem ele`); }
+      }
+      return _mapaBackupSeq_;
+    };
     Logger.log(`🔢 ${ocsElegiveisSeq.size} OC(s) elegíveis à sequência (DT. ENTREGA ≥ ${_fmtBR_(SEQUENCIA_ENTREGA_CORTE)})`);
 
     // PASSO 3: Processar cada linha da fonte
@@ -2195,15 +2215,38 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       // Resolve SEQ_ORIGINAL: número de ordem do item dentro da sua OC, conforme a aba
       // "original" (identificado pelas colunas C,D,E,F,G,H,I,J,K,N). Uma vez atribuída,
       // a sequência é FIXA: preserva o valor já gravado em PEDIDOS (col V) e nunca recalcula.
-      // Atribuição apenas para itens com DATA RECEB. >= SEQUENCIA_DATA_CORTE (11/06/2026).
+      // Atribuição apenas para itens de OC elegível (ao menos 1 item com DT. ENTREGA >= SEQUENCIA_ENTREGA_CORTE).
+      //
+      // Ordem de precedência: (1) número que a linha casada de PEDIDOS já tem; (2) número do BACKUP_SEQUENCIA;
+      // (3) posição na aba "original". A (1) vale MESMO quando o ID da linha foi apagado (isNovo): é o RESET
+      // COMPLETO, que limpa a coluna A — a linha casada é o mesmo item físico e leva o número consigo.
+      // A (2) vem ANTES da (3) porque a aba "original" ENCOLHE quando itens são faturados: derivar dela um item
+      // que perdeu o número pegaria um número livre de item faturado (ex.: o 4º virava 1º) — e é permanente.
       let seqOriginal = '';
-      if (matchEscolhido && !isNovo) {
+      if (matchEscolhido) {
         const seqExist = matchEscolhido.row[PEDIDOS_SEQ_ORIGINAL_COL];
         const seqExistNum = (typeof seqExist === 'number') ? seqExist : Number(String(seqExist || '').trim() || NaN);
         if (isFinite(seqExistNum) && seqExistNum > 0) seqOriginal = seqExistNum;
       }
       const _ocSeq_ = String(fonteRow[8] || '').trim(); // J da fonte: ORD. COMPRA
       const _ocElegivelSeq_ = _ocSeq_ !== '' && ocsElegiveisSeq.has(_ocSeq_);
+      if (seqOriginal === '' && _ocElegivelSeq_) {
+        const bk = _backupSeq_();
+        if (bk) {
+          const ocN = _normSeqVal_(_ocSeq_);
+          const livre = (e) => e && e.oc === ocN && !seqUsadas.has(`${_ocSeq_}|${e.seq}`);
+          let e = codigoFixo ? bk.porUuid.get(codigoFixo) : null;
+          if (!livre(e)) {
+            const lista = bk.porChave.get(_chaveItemSeq_(fonteRow[8], fonteRow[3], fonteRow[6], fonteRow[7], fonteRow[10], fonteRow[12]));
+            e = lista ? lista.find(livre) : null;
+          }
+          if (e) {
+            seqOriginal = e.seq;
+            seqUsadas.add(`${_ocSeq_}|${e.seq}`);
+            sequenciasDoBackup++;
+          }
+        }
+      }
       if (seqOriginal === '' && _ocElegivelSeq_ && originalSeqFifo.size > 0) {
         const chaveSeq = _chaveSeqOriginal_(fonteRow, FONTE_SEQ_KEY_COLS);
         const fila = originalSeqFifo.get(chaveSeq);
@@ -2337,6 +2380,9 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       // Grava timestamp do IMPORTRANGE processado — próxima execução só roda se G2 mudar
       props.setProperty('ULTIMO_IMPORTRANGE_TS', tsAtual);
 
+      if (sequenciasDoBackup > 0) {
+        Logger.log(`   ♻️ ${sequenciasDoBackup} sequência(s) devolvida(s) pelo ${BACKUP_SEQ_SHEET_NAME} (não derivadas da aba "${ORIGINAL_SHEET_NAME}")`);
+      }
       if (itensElegiveisSemSeq > 0) {
         Logger.log(`   ⚠️ ${itensElegiveisSemSeq} item(ns) de OC elegível SEM sequência — não localizados na aba "${ORIGINAL_SHEET_NAME}" (nunca é chutado)`);
       }
@@ -2485,7 +2531,7 @@ function _chaveItemSeq_(oc, pedido, desc, tam, lote, dtrec) {
 function _salvarBackupSequencia_(motivo) {
   const ss = getSpreadsheet_();
   const db = ss.getSheetByName(DB_SHEET_NAME);
-  if (!db || db.getLastRow() < 2) return { gravados: 0 };
+  if (!db || db.getLastRow() < 2) return { gravados: 0, ocs: [] };
 
   const ncols = Math.min(DB_SEQUENCIA_COL + 1, db.getMaxColumns());
   const dados = db.getRange(2, 1, db.getLastRow() - 1, ncols).getValues();
@@ -2500,9 +2546,10 @@ function _salvarBackupSequencia_(motivo) {
       String(r[2] || '').trim(), String(r[DB_PEDIDO_COL] || '').trim(), _descBase_(r[DB_DESC_COL]), String(r[DB_TAM_COL] || '').trim(),
       String(r[DB_LOTE_COL] || '').trim(), dtrec, String(r[STATUS_COL] || '').trim()]);
   });
+  const ocs = [...new Set(linhas.map(l => l[4]))];
   if (linhas.length === 0) {
     Logger.log('ℹ️ Backup da sequência: nenhum item numerado no DB — nada a gravar.');
-    return { gravados: 0 };
+    return { gravados: 0, ocs: [] };
   }
 
   let sh = ss.getSheetByName(BACKUP_SEQ_SHEET_NAME);
@@ -2531,10 +2578,40 @@ function _salvarBackupSequencia_(motivo) {
     if (n > 0) sh.deleteRows(2, n);
   }
   Logger.log(`💾 Backup da sequência: ${linhas.length} item(ns) gravado(s) em ${BACKUP_SEQ_SHEET_NAME} (${rotulo}).`);
-  return { gravados: linhas.length };
+  return { gravados: linhas.length, ocs };
 }
 
 /**
+ * Lê a aba BACKUP_SEQUENCIA e indexa as entradas por UUID (CODIGO_FIXO) e por identidade
+ * (OC|pedido|produto|tamanho|lote|data, lista em ordem de número). A cópia mais nova prevalece.
+ * @returns {{porUuid:Map, porChave:Map, total:number}|null} null se não há backup
+ */
+function _carregarMapaBackupSequencia_() {
+  const bk = getSpreadsheet_().getSheetByName(BACKUP_SEQ_SHEET_NAME);
+  if (!bk || bk.getLastRow() < 2) return null;
+  const entradas = new Map(); // "oc|seq" → entrada (do mais antigo ao mais novo: a mais nova sobrescreve)
+  const ocsBrutas = new Set();
+  bk.getRange(2, 1, bk.getLastRow() - 1, BACKUP_SEQ_HEADERS.length).getValues().forEach(r => {
+    const oc = _normSeqVal_(r[4]), seq = _seqNum_(r[5]);
+    if (!oc || !seq) return;
+    ocsBrutas.add(String(r[4] === null || r[4] === undefined ? '' : r[4]).trim());
+    entradas.set(`${oc}|${seq}`, {
+      oc, seq, uuid: String(r[3] || '').trim(),
+      chave: _chaveItemSeq_(r[4], r[7], r[8], r[9], r[10], r[11])
+    });
+  });
+  if (entradas.size === 0) return null;
+  const porUuid = new Map(), porChave = new Map();
+  [...entradas.values()].sort((a, b) => a.seq - b.seq).forEach(e => {
+    if (e.uuid) porUuid.set(e.uuid, e);
+    if (!porChave.has(e.chave)) porChave.set(e.chave, []);
+    porChave.get(e.chave).push(e);
+  });
+  return { porUuid, porChave, total: entradas.size, ocs: ocsBrutas };
+}
+
+/**
+ * PLANO B (menu "Restaurar sequência do último backup"). No RESET COMPLETO a sequência já volta pelo próprio sync.
  * Devolve ao PEDIDOS (col V) a sequência guardada no backup, SOMENTE em células vazias, casando cada item por
  * CODIGO_FIXO (UUID) ou, na falta, por OC|pedido|produto|tamanho|lote|data. A coluna Y do DB é preenchida na
  * sequência pelo processoAutomaticoCompleto (propagação PEDIDOS → DB). Cópias mais novas prevalecem.
@@ -2543,30 +2620,16 @@ function _salvarBackupSequencia_(motivo) {
 function _restaurarSequenciaDoBackup_() {
   const res = { restaurados: 0, jaTinham: 0, conflitos: 0, ocMudou: 0, semBackup: false, erro: '' };
   const ss = getSpreadsheet_();
-  const bk = ss.getSheetByName(BACKUP_SEQ_SHEET_NAME);
-  if (!bk || bk.getLastRow() < 2) { res.semBackup = true; return res; }
   const ped = ss.getSheetByName(FONTE_SHEET_NAME);
-  if (!ped || ped.getLastRow() < FONTE_DATA_START_ROW) return res;
 
   const lock = LockService.getScriptLock();
-  try { lock.waitLock(30000); } catch (e) { res.erro = 'outra execução em andamento'; return res; }
+  try { lock.waitLock(60000); } catch (e) { res.erro = 'outra execução em andamento'; return res; }
   try {
-    // Backup: do mais antigo ao mais novo; a cópia mais nova prevalece
-    const entradas = new Map(); // "oc|seq" → entrada
-    bk.getRange(2, 1, bk.getLastRow() - 1, BACKUP_SEQ_HEADERS.length).getValues().forEach(r => {
-      const oc = _normSeqVal_(r[4]), seq = _seqNum_(r[5]);
-      if (!oc || !seq) return;
-      entradas.set(`${oc}|${seq}`, {
-        oc, seq, uuid: String(r[3] || '').trim(),
-        chave: _chaveItemSeq_(r[4], r[7], r[8], r[9], r[10], r[11])
-      });
-    });
-    const porUuid = new Map(), porChave = new Map();
-    [...entradas.values()].sort((a, b) => a.seq - b.seq).forEach(e => {
-      if (e.uuid) porUuid.set(e.uuid, e);
-      if (!porChave.has(e.chave)) porChave.set(e.chave, []);
-      porChave.get(e.chave).push(e);
-    });
+    const mapa = _carregarMapaBackupSequencia_();
+    if (!mapa) { res.semBackup = true; return res; }
+    if (!ped || ped.getLastRow() < FONTE_DATA_START_ROW) return res;
+    const { porUuid, porChave } = mapa;
+    res.ocs = mapa.ocs;
 
     const n = ped.getLastRow() - FONTE_DATA_START_ROW + 1;
     const ncols = Math.max(PEDIDOS_SEQ_ORIGINAL_COL + 1, ped.getLastColumn());
@@ -2625,13 +2688,24 @@ function restaurarSequenciaDoBackupMenu() {
     const r = _restaurarSequenciaDoBackup_();
     if (r.erro) { ui.alert('Não foi possível restaurar', r.erro + '. Tente de novo em 1 minuto.', ui.ButtonSet.OK); return; }
     if (r.semBackup) { ui.alert('Sem backup', 'A aba ' + BACKUP_SEQ_SHEET_NAME + ' não existe ou está vazia.', ui.ButtonSet.OK); return; }
-    processoAutomaticoCompleto(); // propaga PEDIDOS (col V) → Relatorio_DB (col Y)
+    _OCS_SEQ_PRESERVAR_ = r.ocs || null; // as OCs do backup propagam para o DB mesmo se a data não as qualificar mais
+    try {
+      processoAutomaticoCompleto(); // propaga PEDIDOS (col V) → Relatorio_DB (col Y)
+    } finally {
+      _OCS_SEQ_PRESERVAR_ = null;
+    }
     ui.alert('♻️ Sequência restaurada',
       'Restaurados: ' + r.restaurados + '\nJá tinham número: ' + r.jaTinham +
       '\nConflitos (número já usado na OC): ' + r.conflitos + '\nOC diferente da do backup: ' + r.ocMudou, ui.ButtonSet.OK);
   } catch (e) {
     ui.alert('Erro', e.message, ui.ButtonSet.OK);
   }
+}
+
+// Soma ao conjunto de OCs elegíveis as que o reset/restauração mandou preservar (ver _OCS_SEQ_PRESERVAR_).
+function _somarOcsPreservadas_(ocsElegiveis) {
+  if (_OCS_SEQ_PRESERVAR_) _OCS_SEQ_PRESERVAR_.forEach(oc => ocsElegiveis.add(oc));
+  return ocsElegiveis;
 }
 
 // Converte DATA RECEB. (Date, 'dd/MM/yyyy' ou 'yyyy-MM-dd') para ms à meia-noite local.
@@ -4708,7 +4782,7 @@ function _propagarSequenciaOriginalParaDB_(dbSheet, pedidosRows) {
   }
 
   // ID → sequência, só das OCs elegíveis, a partir de TODAS as linhas de PEDIDOS
-  const ocsElegiveis = _ocsElegiveisSequencia_(pedidosRows, CARTELA_COL, OC_COL, DTENT_COL);
+  const ocsElegiveis = _somarOcsPreservadas_(_ocsElegiveisSequencia_(pedidosRows, CARTELA_COL, OC_COL, DTENT_COL));
   const idToSeq = new Map();
   (pedidosRows || []).forEach(row => {
     const id = String(row[ID_COL] || '').trim();
