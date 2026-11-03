@@ -118,8 +118,9 @@ const ORIG_SEQ_KEY_COLS  = [2, 3, 4, 5, 6, 7, 8, 9, 10, 13];
 // Mesmos campos em DADOS_IMPORTADOS (fonteRow, 0-based a partir da col B):
 // PEDIDO=3, CÓD. CLIENTE=4, MARFIM=5, DESC=6, TAM=7, OC=8, QTD=9, OS=11, DATA RECEB.=12, LOTE=10
 const FONTE_SEQ_KEY_COLS = [3, 4, 5, 6, 7, 8, 9, 11, 12, 10];
-// Apenas itens com DATA RECEB. (data de entrada) a partir desta data recebem sequência
-const SEQUENCIA_DATA_CORTE = new Date(2026, 5, 11); // 11/06/2026
+// Recebem sequência as OCs INTEIRAS que tenham ao menos 1 item com DT. ENTREGA a partir desta data.
+// A OC toda é numerada (e não só os itens com entrega ≥ corte) para a numeração não ter buracos.
+const SEQUENCIA_ENTREGA_CORTE = new Date(2026, 10, 4); // 04/11/2026
 const DIAS_RETENCAO = 1;       // Idade mínima (dias) para um item Faturado ser purgado.
 // A purga roda em um HORÁRIO FIXO, uma vez por dia — não a toda hora com prazo individual
 // por item. Motivo: o sistema usa etiquetas físicas nos itens; um funcionário precisa de um
@@ -1012,7 +1013,110 @@ function onOpen() {
     .addItem('⚠️ RESET COMPLETO (apaga DB + regenera IDs)', 'resetarEReprocessar')
     .addSeparator()
     .addItem('🔄 Forçar resync agora (aplica correções Dilly)', 'forcarResyncDilly')
+    .addSeparator()
+    .addItem('🔢 Numerar sequências agora (aba original → PEDIDOS → DB)', 'numerarSequenciasAgora')
     .addToUi();
+}
+
+/**
+ * Numera AGORA as sequências das OCs elegíveis (ao menos 1 item com DT. ENTREGA >= SEQUENCIA_ENTREGA_CORTE):
+ *  1. força o sync DADOS_IMPORTADOS → PEDIDOS, que atribui a posição de cada item na aba "original" (col V);
+ *  2. roda o processo completo, que propaga a col V para a SEQUENCIA do Relatorio_DB (col Y).
+ * Seguro para repetir: número já gravado nunca muda; só células vazias são preenchidas.
+ */
+function numerarSequenciasAgora() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    if (_sistemaPausado_()) {
+      ui.alert('⏸ Sistema pausado', 'Retome o sistema pelo menu antes de numerar as sequências.', ui.ButtonSet.OK);
+      return;
+    }
+    if (!getSpreadsheet_().getSheetByName(ORIGINAL_SHEET_NAME)) {
+      ui.alert('Aba "' + ORIGINAL_SHEET_NAME + '" não encontrada',
+        'A sequência vem da posição do item nessa aba. Sem ela não há como numerar.', ui.ButtonSet.OK);
+      return;
+    }
+
+    // Lock só em volta do sync de PEDIDOS; processoAutomaticoCompleto pega o próprio lock.
+    const lock = LockService.getScriptLock();
+    try {
+      lock.waitLock(30000);
+    } catch (e) {
+      ui.alert('Outra execução em andamento', 'Aguarde 1 minuto e tente de novo.', ui.ButtonSet.OK);
+      return;
+    }
+    let resultado;
+    try {
+      resultado = sincronizarPedidosComFonte(true);
+    } finally {
+      lock.releaseLock();
+    }
+    if (resultado.erro || resultado.motivo) {
+      ui.alert('Importação não está pronta',
+        'Nada foi alterado (' + (resultado.erro || resultado.motivo) + '). Tente novamente quando a importação terminar.', ui.ButtonSet.OK);
+      return;
+    }
+
+    processoAutomaticoCompleto();
+
+    const d = _diagnosticoSequencias_();
+    let msg = 'OCs elegíveis (entrega a partir de ' + _fmtBR_(SEQUENCIA_ENTREGA_CORTE) + '): ' + d.ocs + '\n' +
+      'Itens dessas OCs: ' + d.itens + '\n' +
+      'Numerados no PEDIDOS: ' + d.numeradosPedidos + '\n' +
+      'Numerados no Relatorio_DB (usado no relatório): ' + d.numeradosDB + '\n' +
+      'SEM número (não localizados na aba "' + ORIGINAL_SHEET_NAME + '"): ' + d.semNumero;
+    if (d.exemplos.length > 0) msg += '\n\nExemplos sem número:\n' + d.exemplos.join('\n');
+    ui.alert(d.semNumero === 0 && d.numeradosDB === d.itens ? '✅ Sequências numeradas' : '⚠️ Sequências numeradas com pendências', msg, ui.ButtonSet.OK);
+  } catch (e) {
+    ui.alert('Erro', e.message, ui.ButtonSet.OK);
+  }
+}
+
+/**
+ * Resumo da numeração das OCs elegíveis: quantos itens têm sequência em PEDIDOS (col V) e no
+ * Relatorio_DB (col Y), e quais itens elegíveis ficaram sem número. Somente leitura.
+ */
+function _diagnosticoSequencias_() {
+  const ss = getSpreadsheet_();
+  const r = { ocs: 0, itens: 0, numeradosPedidos: 0, numeradosDB: 0, semNumero: 0, exemplos: [] };
+  const ped = ss.getSheetByName(FONTE_SHEET_NAME);
+  if (!ped || ped.getLastRow() < FONTE_DATA_START_ROW) return r;
+
+  const pRows = ped.getRange(FONTE_DATA_START_ROW, 1, ped.getLastRow() - FONTE_DATA_START_ROW + 1,
+    Math.max(PEDIDOS_SEQ_ORIGINAL_COL + 1, ped.getLastColumn())).getValues();
+  const elegiveis = _ocsElegiveisSequencia_(pRows, CARTELA_COL, OC_COL, DTENT_COL);
+  r.ocs = elegiveis.size;
+
+  const idsElegiveis = new Set();
+  pRows.forEach(row => {
+    if (!String(row[CARTELA_COL] || '').trim()) return;
+    const oc = String(row[OC_COL] === null || row[OC_COL] === undefined ? '' : row[OC_COL]).trim();
+    if (!elegiveis.has(oc)) return;
+    r.itens++;
+    idsElegiveis.add(String(row[ID_COL] || '').trim());
+    const v = row[PEDIDOS_SEQ_ORIGINAL_COL];
+    const n = (typeof v === 'number') ? v : Number(String(v || '').trim() || NaN);
+    if (isFinite(n) && n > 0) {
+      r.numeradosPedidos++;
+    } else {
+      r.semNumero++;
+      if (r.exemplos.length < 8) {
+        const desc = String(row[DESC_COL] || '').replace(/\s*\[[0-9a-f-]{36}\]\s*$/i, '').trim();
+        r.exemplos.push('OC ' + oc + ' · ' + desc.substring(0, 40) + ' · ' + String(row[TAM_COL] || '').trim());
+      }
+    }
+  });
+
+  const db = ss.getSheetByName(DB_SHEET_NAME);
+  if (db && db.getLastRow() >= 2) {
+    db.getRange(2, 1, db.getLastRow() - 1, DB_SEQUENCIA_COL + 1).getValues().forEach(row => {
+      if (!idsElegiveis.has(String(row[0] || '').trim())) return;
+      const v = row[DB_SEQUENCIA_COL];
+      const n = (typeof v === 'number') ? v : Number(String(v || '').trim() || NaN);
+      if (isFinite(n) && n > 0) r.numeradosDB++;
+    });
+  }
+  return r;
 }
 
 /**
@@ -1636,6 +1740,12 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       Logger.log(`📋 PEDIDOS está vazio (primeira sincronização)`);
     }
 
+    // OCs que recebem sequência: ao menos 1 item com DT. ENTREGA ≥ SEQUENCIA_ENTREGA_CORTE.
+    // fonteRow (a partir da col B): CARTELA=0, ORD. COMPRA=8, DT. ENTREGA=13.
+    const ocsElegiveisSeq = _ocsElegiveisSequencia_(fonteData, 0, 8, 13);
+    let itensElegiveisSemSeq = 0; // itens de OC elegível que a aba "original" não numerou
+    Logger.log(`🔢 ${ocsElegiveisSeq.size} OC(s) elegíveis à sequência (DT. ENTREGA ≥ ${_fmtBR_(SEQUENCIA_ENTREGA_CORTE)})`);
+
     // PASSO 3: Processar cada linha da fonte
     const novasPedidosData = [];
     let linhasResgatadas = 0; // linhas quebradas cuja versão anterior foi preservada
@@ -2048,22 +2158,22 @@ function sincronizarPedidosComFonte(forcarExecucao) {
         const seqExistNum = (typeof seqExist === 'number') ? seqExist : Number(String(seqExist || '').trim() || NaN);
         if (isFinite(seqExistNum) && seqExistNum > 0) seqOriginal = seqExistNum;
       }
-      if (seqOriginal === '' && originalSeqFifo.size > 0) {
-        const entradaMs = _dataEntradaMs_(fonteRow[12]); // N da fonte: DATA RECEB. (data de entrada)
-        if (entradaMs !== null && entradaMs >= SEQUENCIA_DATA_CORTE.getTime()) {
-          const chaveSeq = _chaveSeqOriginal_(fonteRow, FONTE_SEQ_KEY_COLS);
-          const fila = originalSeqFifo.get(chaveSeq);
-          if (fila) {
-            // Pula slots cuja sequência já pertence a outro item (PEDIDOS col V ou DB col Y)
-            while (fila.length > 0 && seqUsadas.has(`${fila[0].oc}|${fila[0].seq}`)) fila.shift();
-            if (fila.length > 0) {
-              const slot = fila.shift();
-              seqOriginal = slot.seq;
-              seqUsadas.add(`${slot.oc}|${slot.seq}`);
-            }
+      const _ocSeq_ = String(fonteRow[8] || '').trim(); // J da fonte: ORD. COMPRA
+      const _ocElegivelSeq_ = _ocSeq_ !== '' && ocsElegiveisSeq.has(_ocSeq_);
+      if (seqOriginal === '' && _ocElegivelSeq_ && originalSeqFifo.size > 0) {
+        const chaveSeq = _chaveSeqOriginal_(fonteRow, FONTE_SEQ_KEY_COLS);
+        const fila = originalSeqFifo.get(chaveSeq);
+        if (fila) {
+          // Pula slots cuja sequência já pertence a outro item (PEDIDOS col V ou DB col Y)
+          while (fila.length > 0 && seqUsadas.has(`${fila[0].oc}|${fila[0].seq}`)) fila.shift();
+          if (fila.length > 0) {
+            const slot = fila.shift();
+            seqOriginal = slot.seq;
+            seqUsadas.add(`${slot.oc}|${slot.seq}`);
           }
         }
       }
+      if (_ocElegivelSeq_ && seqOriginal === '') itensElegiveisSemSeq++;
 
       // Para o cliente Dilly: corrige CÓD. MARFIM (col G) — veja _normalizarMarfimDilly_
       const _codMarfimFinal_ = _normalizarMarfimDilly_(
@@ -2183,12 +2293,17 @@ function sincronizarPedidosComFonte(forcarExecucao) {
       // Grava timestamp do IMPORTRANGE processado — próxima execução só roda se G2 mudar
       props.setProperty('ULTIMO_IMPORTRANGE_TS', tsAtual);
 
+      if (itensElegiveisSemSeq > 0) {
+        Logger.log(`   ⚠️ ${itensElegiveisSemSeq} item(ns) de OC elegível SEM sequência — não localizados na aba "${ORIGINAL_SHEET_NAME}" (nunca é chutado)`);
+      }
+
       const houveMudancas = novosItens > 0 || itensComMudancaReal > 0;
       return {
         houveMudancas: houveMudancas,
         novos: novosItens,
         atualizados: itensAtualizados,
-        total: novasPedidosData.length
+        total: novasPedidosData.length,
+        semSequencia: itensElegiveisSemSeq
       };
     } else {
       Logger.log("⚠️ Nenhum dado para sincronizar");
@@ -2287,6 +2402,22 @@ function _normSeqVal_(v) {
 // Chave de identificação de um item: junção normalizada das colunas indicadas.
 function _chaveSeqOriginal_(row, cols) {
   return cols.map(i => _normSeqVal_(row[i])).join('|');
+}
+
+// Conjunto de OCs elegíveis à sequência: as que têm ao menos 1 item com DT. ENTREGA ≥ SEQUENCIA_ENTREGA_CORTE.
+// A OC inteira é elegível — inclusive os itens dela com entrega anterior ao corte.
+// Data vazia/irreconhecível não conta (nunca chuta). Linhas sem CARTELA são ruído e são ignoradas.
+function _ocsElegiveisSequencia_(rows, colCartela, colOc, colEntrega) {
+  const corte = SEQUENCIA_ENTREGA_CORTE.getTime();
+  const ocs = new Set();
+  (rows || []).forEach(row => {
+    if (!String(row[colCartela] === null || row[colCartela] === undefined ? '' : row[colCartela]).trim()) return;
+    const oc = String(row[colOc] === null || row[colOc] === undefined ? '' : row[colOc]).trim();
+    if (!oc || ocs.has(oc)) return;
+    const entregaMs = _dataEntradaMs_(row[colEntrega]);
+    if (entregaMs !== null && entregaMs >= corte) ocs.add(oc);
+  });
+  return ocs;
 }
 
 // Converte DATA RECEB. (Date, 'dd/MM/yyyy' ou 'yyyy-MM-dd') para ms à meia-noite local.
@@ -4216,7 +4347,7 @@ function sincronizarDados() {
     // Propaga SEQ_ORIGINAL (PEDIDOS col V) para SEQUENCIA (Relatorio_DB col Y).
     // Grava apenas células ainda vazias — uma vez gravada, a sequência NUNCA é alterada.
     try {
-      const seqGravadas = _propagarSequenciaOriginalParaDB_(dbSheet, fonteMap);
+      const seqGravadas = _propagarSequenciaOriginalParaDB_(dbSheet, fonteData);
       if (seqGravadas > 0) Logger.log(`   🔢 ${seqGravadas} sequência(s) da aba "original" gravada(s) no DB (col Y)`);
     } catch (eSeq) {
       Logger.log(`   ⚠️ Erro ao propagar sequências para o DB: ${eSeq.message}`);
@@ -4338,11 +4469,15 @@ function _mesclarAlteracoesConcorrentes_(dbSheet, dbData, updates) {
  * Propaga a sequência da aba "original" (PEDIDOS col V) para o Relatorio_DB (col Y).
  * Regras de integridade:
  *  - Grava SOMENTE células vazias de Y — sequência gravada é imutável.
- *  - Apenas itens com DATA RECEB. >= SEQUENCIA_DATA_CORTE.
+ *  - Apenas itens de OCs elegíveis (ao menos 1 item com DT. ENTREGA >= SEQUENCIA_ENTREGA_CORTE).
+ *  - Lê TODAS as linhas de PEDIDOS, não só as novas: a sequência pode ser atribuída em PEDIDOS depois
+ *    que o item já entrou no DB (era o defeito: com 'fonteMap' esses itens nunca chegavam à col Y).
  *  - Se a coluna Y tiver cabeçalho de outro nome, aborta sem tocar em nada.
+ * @param {Sheet} dbSheet     aba Relatorio_DB
+ * @param {Array} pedidosRows linhas cruas de PEDIDOS (todas, inclusive as já correspondidas)
  * @returns {number} quantidade de sequências gravadas
  */
-function _propagarSequenciaOriginalParaDB_(dbSheet, fonteMap) {
+function _propagarSequenciaOriginalParaDB_(dbSheet, pedidosRows) {
   // Garante espaço físico até a coluna Y
   if (dbSheet.getMaxColumns() < DB_SEQUENCIA_COL + 1) {
     dbSheet.insertColumnsAfter(dbSheet.getMaxColumns(), DB_SEQUENCIA_COL + 1 - dbSheet.getMaxColumns());
@@ -4358,13 +4493,17 @@ function _propagarSequenciaOriginalParaDB_(dbSheet, fonteMap) {
     return 0;
   }
 
-  // ID → sequência, a partir das linhas de PEDIDOS recém-sincronizadas
+  // ID → sequência, só das OCs elegíveis, a partir de TODAS as linhas de PEDIDOS
+  const ocsElegiveis = _ocsElegiveisSequencia_(pedidosRows, CARTELA_COL, OC_COL, DTENT_COL);
   const idToSeq = new Map();
-  for (const [id, row] of fonteMap.entries()) {
+  (pedidosRows || []).forEach(row => {
+    const id = String(row[ID_COL] || '').trim();
+    if (!id) return;
+    if (!ocsElegiveis.has(String(row[OC_COL] === null || row[OC_COL] === undefined ? '' : row[OC_COL]).trim())) return;
     const v = row[PEDIDOS_SEQ_ORIGINAL_COL];
     const n = (typeof v === 'number') ? v : Number(String(v || '').trim() || NaN);
     if (isFinite(n) && n > 0) idToSeq.set(id, n);
-  }
+  });
   if (idToSeq.size === 0) return 0;
 
   const lastRow = dbSheet.getLastRow();
@@ -4378,8 +4517,6 @@ function _propagarSequenciaOriginalParaDB_(dbSheet, fonteMap) {
     if (String(colY[i][0] === null || colY[i][0] === undefined ? '' : colY[i][0]).trim() !== '') return; // já fixada
     const id = String(row[0] || '').trim();
     if (!id || !idToSeq.has(id)) return;
-    const entradaMs = _dataEntradaMs_(row[11]); // L: DATA RECEB. (data de entrada)
-    if (entradaMs === null || entradaMs < SEQUENCIA_DATA_CORTE.getTime()) return;
     colY[i][0] = idToSeq.get(id);
     gravadas++;
   });
