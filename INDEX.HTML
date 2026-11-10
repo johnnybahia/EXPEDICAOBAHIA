@@ -361,9 +361,13 @@
     .btn-logout { padding: 0.35rem 0.75rem; background: #fee2e2; color: #dc2626; border: 1px solid #fca5a5; border-radius: 0.375rem; font-size: 0.78rem; font-weight: 600; cursor: pointer; transition: all 0.2s; white-space: nowrap; }
     .btn-logout:hover { background: #dc2626; color: white; border-color: #dc2626; }
 
-  </style>
+    .faixa-versao{background:#1f2937;color:#e5e7eb;font-size:12px;text-align:center;padding:4px 8px;}
+  @media print{.faixa-versao{display:none !important;}}
+</style>
 </head>
 <body>
+
+  <div id="faixa-versao" class="faixa-versao">Versão <?= versao ?> · atualizado em <?= versaoData ?></div>
 
   <!-- Loader -->
   <div id="loader" class="hidden">
@@ -1707,6 +1711,8 @@
         console.log(`🔍 Dados de autocomplete construídos: ${autocompleteData.length} itens`);
     }
     
+    const aplicarFiltrosDebounced = debounce(() => aplicarFiltros(), 300);
+
     $searchOC.addEventListener('input', (e) => {
         const term = _normSearch_(e.target.value);
         
@@ -1726,7 +1732,7 @@
             hideAutocomplete();
         }
         
-        aplicarFiltros();
+        aplicarFiltrosDebounced();
     });
     
     $searchOC.addEventListener('keydown', (e) => {
@@ -1948,7 +1954,9 @@
                       cliente:    oc.cliente,
                       infoX:      oc.infoX      || '',
                       infoY:      oc.infoY      || '',
-                      posicaoMin: oc.posicaoMin  ?? 999999
+                      posicaoMin: oc.posicaoMin  ?? 999999,
+                      _ocN:       _normSearch_(oc.ordCompraId),
+                      _cliN:      _normSearch_(oc.cliente)
                     }));
 
                     // Detecta e notifica novas OCs (apenas no auto-refresh, não na carga inicial)
@@ -2066,8 +2074,8 @@ ALL_OCS_ITEMS = itemsObj;
         
         if (searchTerm) {
             filtered = filtered.filter(oc => {
-                const ocNorm = _normSearch_(oc.ordCompra);
-                const clienteNorm = _normSearch_(oc.cliente);
+                const ocNorm = oc._ocN ?? _normSearch_(oc.ordCompra);
+                const clienteNorm = oc._cliN ?? _normSearch_(oc.cliente);
                 return ocNorm.includes(searchTerm) || clienteNorm.includes(searchTerm);
             });
         }

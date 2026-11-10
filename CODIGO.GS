@@ -4,6 +4,10 @@
 // COM CACHE - CARREGAMENTO RÁPIDO
 // ====================================================
 
+// ====== VERSÃO (fonte única) ======
+const VERSAO = '1.0.0';
+const VERSAO_DATA = '10/11/2026';
+
 // ====== CONFIGURAÇÃO ======
 // Lazy getter — evita chamada de API no escopo global, que impede simple triggers (onOpen) de inicializar.
 // getActiveSpreadsheet() funciona no contexto de script vinculado; openById() funciona no web app (doGet).
@@ -224,7 +228,10 @@ function _toISOStringSafe_(date) {
 
 // ====== FUNÇÃO WEB APP ======
 function doGet(e) {
-  return HtmlService.createHtmlOutputFromFile('index')
+  const tpl = HtmlService.createTemplateFromFile('index');
+  tpl.versao = VERSAO;
+  tpl.versaoData = VERSAO_DATA;
+  return tpl.evaluate()
     .setTitle('Relatório de Pedidos v15.6')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
