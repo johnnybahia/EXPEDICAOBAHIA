@@ -12,6 +12,7 @@ const repasse = args.filter(a => a !== '--resumo');
 const ETAPAS = [
   ['cenarios.js', 'sync, faturamento, aviso de conferência, trava, reset e desempenho'],
   ['sequencia.js', 'sequência por OC: elegibilidade, aba original → PEDIDOS → DB, imutabilidade'],
+  ['marcacao.js', 'marcação × faturamento parcial: reset atômico, marcação vencida, relatório, linha deslocada'],
   ['tela.js', 'tela no Chromium']
 ];
 

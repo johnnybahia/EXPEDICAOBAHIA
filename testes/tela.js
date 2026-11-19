@@ -30,7 +30,7 @@ const LISTA = [
     const mk = (ok, fail) => new Proxy({}, { get: (_, nome) => {
       if (nome === 'withSuccessHandler') return fn => mk(fn, fail);
       if (nome === 'withFailureHandler') return fn => mk(ok, fn);
-      return (...args) => { window.__chamadas.push({ nome, args }); setTimeout(() => { if (ok) ok(nome === 'confirmarSaidaFonte' ? { success: true } : null); }, 5); };
+      return (...args) => { window.__chamadas.push({ nome, args }); setTimeout(() => { if (ok) ok((nome === 'confirmarSaidaFonte' || nome === 'marcarParaFaturar') ? { success: true } : null); }, 5); };
     } });
     window.google = { script: { run: mk(null, null) } };
     window.confirm = () => true;
@@ -70,6 +70,31 @@ const LISTA = [
   r.totalAbre = await visivel('#conferenciaSaidaModal');
   await page.evaluate(l => { fecharConferenciaSaida(); atualizarPendentesSaida(l); }, LISTA);
   r.naoReabre = !(await visivel('#conferenciaSaidaModal'));
+
+  // Marcar item com baixa parcial: janela com TOTAL / PARCIAL / CANCELAR (o confirm() antigo marcava no "Cancelar")
+  await page.evaluate(() => {
+    fecharConferenciaSaida();
+    document.body.insertAdjacentHTML('beforeend', '<table><tbody><tr id="item-linha-77" data-item-qtd="12" data-item-qtd-original="323"><td><input type="checkbox" class="checkbox-faturar" checked></td></tr></tbody></table>');
+    window.__chamadas = [];
+    handleMarcarFaturar('ID-P', 77, true);
+  });
+  r.parcialJanela = await visivel('#baixaConfirmacaoModal');
+  r.parcialTexto = await page.textContent('#baixa-confirmacao-msg');
+  r.parcialCancelarVisivel = await visivel('#baixa-confirmacao-cancelar-btn');
+  await page.click('#baixa-confirmacao-cancelar-btn');
+  await page.waitForTimeout(50);
+  r.cancelou = await page.evaluate(() => ({ marcou: window.__chamadas.some(c => c.nome === 'marcarParaFaturar'), checkbox: document.querySelector('#item-linha-77 .checkbox-faturar').checked }));
+  await page.evaluate(() => { document.querySelector('#item-linha-77 .checkbox-faturar').checked = true; handleMarcarFaturar('ID-P', 77, true); });
+  await page.click('#baixa-confirmacao-parcial-btn');
+  await page.waitForTimeout(50);
+  r.parcialChamada = await page.evaluate(() => (window.__chamadas.find(c => c.nome === 'marcarParaFaturar') || {}).args);
+  await page.evaluate(() => showBaixaConfirmacaoModal('x', () => {}, () => {}));
+  r.posBaixaSemCancelar = !(await visivel('#baixa-confirmacao-cancelar-btn'));
+  await page.evaluate(() => hideBaixaConfirmacaoModal());
+  // Faixa de versão: visível na tela, some na impressão
+  r.faixa = await visivel('#faixa-versao');
+  await page.emulateMedia({ media: 'print' });
+  r.faixaImpressao = await visivel('#faixa-versao');
   await browser.close();
 
   R.t('nível TOTAL: a janela abre sozinha com um card por item e o contador no cabeçalho', () => {
@@ -89,6 +114,14 @@ const LISTA = [
   });
   R.t('nível PARCIAL não vê nem abre a janela', () => { assert.strictEqual(r.parcialAbre, false); assert.strictEqual(r.parcialAbreManual, false); });
   R.t('nível TOTAL abre item novo uma vez e não reabre o já apresentado', () => { assert.strictEqual(r.totalAbre, true); assert.strictEqual(r.naoReabre, true); });
+  R.t('marcar item parcial abre TOTAL / PARCIAL / CANCELAR com o baixado e o saldo', () => {
+    assert.strictEqual(r.parcialJanela, true); assert.strictEqual(r.parcialCancelarVisivel, true);
+    assert.match(r.parcialTexto, /Baixado neste ciclo: 311/); assert.match(r.parcialTexto, /Saldo em aberto: 12/);
+  });
+  R.t('CANCELAR não marca e desmarca a caixa', () => assert.deepStrictEqual(r.cancelou, { marcou: false, checkbox: false }));
+  R.t('PARCIAL marca só o baixado: marcarParaFaturar(id, linha, true, usuário, perfil)', () => assert.deepStrictEqual(r.parcialChamada, ['ID-P', 77, true, 'ANA', 'BAIXA1']));
+  R.t('a janela depois da baixa continua só com TOTAL e PARCIAL', () => assert.strictEqual(r.posBaixaSemCancelar, true));
+  R.t('faixa de versão aparece na tela e some na impressão', () => { assert.strictEqual(r.faixa, true); assert.strictEqual(r.faixaImpressao, false); });
   R.t('a página não gera erro de JavaScript', () => assert.deepStrictEqual(errosDePagina, []));
   R.fim();
 })().catch(e => { console.error('❌', e.message); process.exit(1); });

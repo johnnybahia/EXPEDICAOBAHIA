@@ -19,6 +19,11 @@ const FONTE_DATA_START_ROW = 4;
 const TZ = 'America/Fortaleza';
 const APP_VERSION = '15.7-SINCRONIZACAO';
 
+// Versão mostrada na faixa acima do programa (INDEX.HTML, repassada por doGet). Toda alteração sobe a
+// versão e ganha uma linha em NOTAS.md — regra do CLAUDE.md.
+const VERSAO = '1.0.0';
+const VERSAO_DATA = '19/11/2026';
+
 // Utilities.formatDate é uma chamada de serviço do Apps Script (~ms cada). Chamada por linha em
 // cada impressão digital, ela somava minutos por sincronização (ETAPA 0 levou 306 s em 26/10/2026
 // com 2452 linhas e a execução estourou os 360 s). As datas distintas são poucas (dezenas), então
@@ -224,7 +229,11 @@ function _toISOStringSafe_(date) {
 
 // ====== FUNÇÃO WEB APP ======
 function doGet(e) {
-  return HtmlService.createHtmlOutputFromFile('index')
+  // Template (e não createHtmlOutputFromFile) para a faixa de versão receber VERSAO/VERSAO_DATA
+  const pagina = HtmlService.createTemplateFromFile('index');
+  pagina.versao = VERSAO;
+  pagina.versaoData = VERSAO_DATA;
+  return pagina.evaluate()
     .setTitle('Relatório de Pedidos v15.6')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
@@ -390,6 +399,147 @@ function _registrarCheckpointFaturamento_(uniqueId, qtdAberta) {
   } catch (e) {
     Logger.log(`❌ _registrarCheckpointFaturamento_: ${e.message}`);
   }
+}
+
+/**
+ * Grava CHECKPOINTs no Baixas_Historico lendo o cabeçalho uma vez. Linha a linha com appendRow (e não
+ * setValues em getLastRow()+1): uma baixa que a tela grave no mesmo instante não pode ser sobrescrita.
+ * lista: [{id, qtd}] — qtd = nova base do ciclo (QTD aberta na origem). Devolve quantos gravou.
+ */
+function _registrarCheckpointsEmLote_(lista) {
+  const validos = (lista || []).filter(c => c && String(c.id || '').trim() && Number(c.qtd) > 0);
+  if (validos.length === 0) return 0;
+  try {
+    const sheet = _getBaixasSheet_();
+    const numCols = sheet.getLastColumn();
+    const headers = sheet.getRange(1, 1, 1, numCols).getValues()[0];
+    const colMap = {};
+    headers.forEach((h, i) => { colMap[String(h).trim()] = i; });
+    if (colMap['TIPO'] === undefined) {
+      Logger.log(`⚠️ Coluna TIPO não encontrada no Baixas_Historico, checkpoint não registrado`);
+      return 0;
+    }
+    const agora = new Date();
+    validos.forEach(c => {
+      const novaLinha = new Array(numCols).fill('');
+      novaLinha[colMap['ID_ITEM']]      = String(c.id).trim();
+      novaLinha[colMap['DATA_HORA']]    = agora;
+      novaLinha[colMap['QTD_BAIXADA']]  = 0;
+      novaLinha[colMap['QTD_RESTANTE']] = Number(c.qtd);
+      novaLinha[colMap['QTD_ORIGINAL']] = Number(c.qtd); // nova base para cálculo de saldo
+      novaLinha[colMap['USUARIO']]      = 'FATURAMENTO';
+      novaLinha[colMap['TIPO']]         = 'CHECKPOINT';
+      sheet.appendRow(novaLinha);
+      Logger.log(`🏁 Checkpoint de faturamento: "${c.id}" → nova base ${c.qtd}`);
+    });
+    SpreadsheetApp.flush();
+    _qtdOriginalCache_ = null;
+    _saldoEfetivoCache_ = null;
+    _ultimaQtdOriginalCache_ = null;
+    return validos.length;
+  } catch (e) {
+    Logger.log(`❌ _registrarCheckpointsEmLote_: ${e.message}`);
+    return 0;
+  }
+}
+
+/**
+ * IDs cujo ÚLTIMO registro no Baixas_Historico é um CHECKPOINT: o ciclo foi encerrado (o ERP faturou) e
+ * não houve baixa nova desde então — não há o que faturar. Item assim que ainda está marcado tem marcação
+ * de ciclo anterior (incidente de 18/11/2026). Lê só as colunas ID_ITEM e TIPO.
+ */
+function _idsComCicloSemBaixa_() {
+  const ids = new Set();
+  try {
+    const sheet = _getBaixasSheet_();
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) return ids;
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    const idCol = headers.indexOf('ID_ITEM'), tipoCol = headers.indexOf('TIPO');
+    if (idCol < 0 || tipoCol < 0) return ids;
+    const colIds   = sheet.getRange(2, idCol + 1, lastRow - 1, 1).getValues();
+    const colTipos = sheet.getRange(2, tipoCol + 1, lastRow - 1, 1).getValues();
+    const ultimoTipo = new Map();
+    colIds.forEach((r, i) => {
+      const id = String(r[0] || '').trim();
+      if (id) ultimoTipo.set(id, String(colTipos[i][0] || '').trim().toUpperCase());
+    });
+    ultimoTipo.forEach((tipo, id) => { if (tipo === 'CHECKPOINT') ids.add(id); });
+  } catch (e) {
+    Logger.log(`⚠️ _idsComCicloSemBaixa_: ${e.message}`);
+  }
+  return ids;
+}
+
+/** Último registro do item no Baixas_Historico ({tipo, qtdOriginal}) ou null se o item não tem histórico. */
+function _ultimoRegistroBaixa_(uniqueId) {
+  const id = String(uniqueId || '').trim();
+  if (!id) return null;
+  const sheet = _getBaixasSheet_();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  const numCols = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, numCols).getValues()[0].map(h => String(h).trim());
+  const idCol = headers.indexOf('ID_ITEM');
+  if (idCol < 0) return null;
+  // TextFinder: a busca roda no servidor — o clique não traz as milhares de linhas do histórico
+  const achados = sheet.getRange(2, idCol + 1, lastRow - 1, 1)
+    .createTextFinder(id).matchEntireCell(true).matchCase(true).findAll();
+  if (!achados || achados.length === 0) return null;
+  let linha = 0;
+  achados.forEach(r => { if (r.getRow() > linha) linha = r.getRow(); });
+  const row = sheet.getRange(linha, 1, 1, numCols).getValues()[0];
+  const tipoCol = headers.indexOf('TIPO'), origCol = headers.indexOf('QTD_ORIGINAL');
+  return {
+    tipo: tipoCol >= 0 ? String(row[tipoCol] || '').trim().toUpperCase() : '',
+    qtdOriginal: origCol >= 0 ? _toNumber_(row[origCol]) : 0
+  };
+}
+
+/** A linha do Relatorio_DB está marcada para faturar em algum perfil (P, V ou X preenchida). */
+function _temMarcacao_(row) {
+  return String(row[MARCAR_FATURAR_COL] || '').trim().toUpperCase() === 'SIM'
+    || String(row[MARCAR_FATURAR_USUARIO_COL] || '').trim() !== ''
+    || String(row[PERFIL_EMISSAO_COL] || '').trim() !== '';
+}
+
+/**
+ * Encerra a marcação na linha que o sync vai gravar: estende novaLinha (A–U) até a coluna X com os valores
+ * atuais e esvazia P (MARCAR_FATURAR), V (usuário), W (lote de emissão) e X (perfil) — tudo na MESMA
+ * escrita da linha. Antes V/W eram limpas num passo separado no fim do sync e X nunca era limpa.
+ */
+function _encerrarMarcacaoNaLinha_(novaLinha, dbRow) {
+  for (let c = novaLinha.length; c <= PERFIL_EMISSAO_COL; c++) {
+    novaLinha[c] = (dbRow && c < dbRow.length && dbRow[c] !== undefined && dbRow[c] !== null) ? dbRow[c] : '';
+  }
+  novaLinha[MARCAR_FATURAR_COL]         = '';
+  novaLinha[MARCAR_FATURAR_USUARIO_COL] = '';
+  novaLinha[LOTE_EMISSAO_COL]           = '';
+  novaLinha[PERFIL_EMISSAO_COL]         = '';
+  return novaLinha;
+}
+
+/**
+ * Prepara a atualização do sync que encerra a marcação (reset de ciclo ou marcação vencida). O CHECKPOINT
+ * do reset NÃO é gravado aqui: vai junto da atualização e só é gravado depois da linha (fase 4). Se a
+ * execução morrer antes (limite de 6 min), nada fica pela metade e a rodada seguinte refaz o reset.
+ * idHistorico = ID com que o item aparece no Baixas_Historico nesta rodada (o antigo, se o ID mudou).
+ */
+function _prepararEncerramento_(u, dbRow, idHistorico, reset) {
+  _encerrarMarcacaoNaLinha_(u.dados, dbRow);
+  u.encerramento = { idHistorico: idHistorico, reset: reset, tinhaMarcacao: _temMarcacao_(dbRow), linhaAntes: dbRow };
+}
+
+/** Depois de gravada a linha: guarda o CHECKPOINT do reset e registra no Historico_Decisoes a marcação encerrada. */
+function _registrarEncerramento_(u, checkpoints) {
+  const enc = u.encerramento;
+  if (enc.reset) checkpoints.push({ id: enc.idHistorico, qtd: enc.reset.qtd });
+  if (!enc.tinhaMarcacao) return;
+  const detalhe = enc.reset
+    ? `ciclo encerrado: a origem passou de ${enc.reset.base} para ${enc.reset.qtd} (NF da parte baixada) — o saldo restante não fica marcado`
+    : 'sem baixa desde o último faturamento (CHECKPOINT) — marcação de ciclo anterior encerrada pelo sistema';
+  _registrarDecisao_('MARCACAO_ENCERRADA', _usuarioDaMarcacao_(enc.linhaAntes[MARCAR_FATURAR_USUARIO_COL]),
+    'sincronização', enc.linhaAntes, detalhe);
 }
 
 // Constrói (ou retorna do cache) um mapa {uniqueId → soma de QTD_BAIXADA desde o último CHECKPOINT}.
@@ -857,12 +1007,11 @@ function aplicarBaixa(uniqueId, planilhaLinha, qtdBaixa, usuarioHtml) {
     // Abre fresh para evitar leitura em cache de container do Apps Script
     const ssLive = SpreadsheetApp.openById("1dhI8tDOyNCktaoaqyR39xOn6KFNBhYh5eJDfdV-fa_I");
     const sheet = ssLive.getSheetByName(DB_SHEET_NAME);
-    const linhaNum = Number(planilhaLinha);
 
     if (!sheet) throw new Error("Aba DB não encontrada");
-    if (!isFinite(linhaNum) || linhaNum < 2 || linhaNum > sheet.getLastRow()) {
-      throw new Error(`Linha inválida: ${planilhaLinha}`);
-    }
+    // Confere o ID antes de mexer na QTD: com a linha deslocada (limpeza diária apaga linhas) a baixa
+    // cairia em outro item
+    const linhaNum = _resolverLinhaDoItem_(sheet, uniqueId, planilhaLinha);
 
     // Lê cabeçalhos para encontrar colunas corretas
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -3872,9 +4021,12 @@ function sincronizarDados() {
     const qtdBaselineCicloMap = _buildQtdOriginalCache_();
     Logger.log(`   ${Object.keys(qtdBaselineCicloMap).length} baselines de ciclo carregados`);
 
-    // Itens que sofreram reset nesta sync — precisam ter MARCAR_FATURAR_USUARIO (col V) limpo separadamente,
-    // pois novaLinha só cobre 21 colunas (A-U) e não alcança a col V.
-    const idsParaLimparUsuario = [];
+    // Marcação vencida: item marcado, com QTD aberta, cujo último registro no histórico é CHECKPOINT — o ciclo
+    // já foi faturado e não houve baixa nova. Sobra de um reset que ficou pela metade; o sync encerra.
+    const idsCicloSemBaixa = _idsComCicloSemBaixa_();
+    const _marcacaoVencida_ = (idHist, row, st) =>
+      st !== 'Faturado' && st !== 'Finalizado' && st !== 'Excluido'
+      && _toNumber_(row[DB_QTD_COL]) > 0 && idsCicloSemBaixa.has(idHist) && _temMarcacao_(row);
 
     // IDs com alerta ativo = MARCAR_FATURAR=SIM foi setado pelo SYNC (saída inesperada).
     // IDs sem alerta ativo = MARCAR_FATURAR=SIM foi setado pelo USUÁRIO (fluxo correto).
@@ -3970,12 +4122,15 @@ function sincronizarDados() {
           && baselineCicloId !== undefined && pedidosQtd !== baselineCicloId
           && statusAtual !== "Faturado" && statusAtual !== "Finalizado";
         const qtdParaDB = (temBaixasId && !resetCiclo) ? dbQtd : pedidosQtd;
+        const vencidaId = !resetCiclo && _marcacaoVencida_(id, dbItem.row, statusAtual);
         if (resetCiclo) {
+          // CHECKPOINT e limpeza da marcação vão juntos na gravação da linha (_prepararEncerramento_)
           marcarFaturarAtual = '';
-          _registrarCheckpointFaturamento_(id, pedidosQtd);
           _removerAlertasDoItem_(id);
-          idsParaLimparUsuario.push({ id: id, linha: dbItem.linha });
           Logger.log(`   🔁 RESET ciclo faturamento: ID="${id}" baseline=${baselineCicloId} → fonte=${pedidosQtd}`);
+        } else if (vencidaId) {
+          marcarFaturarAtual = '';
+          Logger.log(`   🧹 Marcação vencida (sem baixa desde o último CHECKPOINT): ID="${id}" — encerrada`);
         } else if (!temBaixasId && pedidosQtd !== dbQtd) {
           Logger.log(`   🔄 QTD sincronizada com fonte: ${dbQtd} → ${pedidosQtd} (sem baixas registradas, ID="${id}")`);
         }
@@ -4009,12 +4164,14 @@ function sincronizarDados() {
           if (dbLote !== novLote) mudou = true;
         }
 
-        if (mudou || resetCiclo || statusAtual === "Inativo") {
+        if (mudou || resetCiclo || vencidaId || statusAtual === "Inativo") {
           // FIX: preserva "Faturado" e "Finalizado" - não regride para "Ativo" se o item
           // voltou ao DADOS_IMPORTADOS após já ter sido processado pelo usuário do HTML.
           const novoStatus = (statusAtual === "Faturado" || statusAtual === "Finalizado") ? statusAtual : "Ativo";
           novaLinha[STATUS_COL] = novoStatus;  // Coluna O (índice 14)
-          updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: id });
+          const uId = { linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: id };
+          if (resetCiclo || vencidaId) _prepararEncerramento_(uId, dbItem.row, id, resetCiclo ? { qtd: pedidosQtd, base: baselineCicloId } : null);
+          updates.push(uId);
         }
 
         // Detecta divergência de QTD quando o usuário tem baixas (sem-baixas é auto-corrigido acima).
@@ -4075,12 +4232,14 @@ function sincronizarDados() {
             && baselineCicloCf !== undefined && pedidosQtdCf !== baselineCicloCf
             && statusAtual !== "Faturado" && statusAtual !== "Finalizado";
           const qtdParaDBCf     = (temBaixasCf && !resetCicloCf) ? dbQtdCf : pedidosQtdCf;
+          const vencidaCf = !resetCicloCf && _marcacaoVencida_(id, dbItem.row, statusAtual);
           if (resetCicloCf) {
-            marcarFaturarAtual = '';
-            _registrarCheckpointFaturamento_(id, pedidosQtdCf);
+            marcarFaturarAtual = '';   // CHECKPOINT só depois da linha gravada (_prepararEncerramento_)
             _removerAlertasDoItem_(id);
-            idsParaLimparUsuario.push({ id: id, linha: dbItem.linha });
             Logger.log(`   🔁 RESET ciclo faturamento (UUID): ID="${id}" baseline=${baselineCicloCf} → fonte=${pedidosQtdCf}`);
+          } else if (vencidaCf) {
+            marcarFaturarAtual = '';
+            Logger.log(`   🧹 Marcação vencida (UUID): ID="${id}" — encerrada`);
           } else if (!temBaixasCf && pedidosQtdCf !== dbQtdCf) {
             Logger.log(`   🔄 QTD sincronizada com fonte (UUID): ${dbQtdCf} → ${pedidosQtdCf} (sem baixas registradas, ID="${id}")`);
           }
@@ -4099,7 +4258,9 @@ function sincronizarDados() {
           const novoStatus = (statusAtual === "Faturado" || statusAtual === "Finalizado") ? statusAtual : "Ativo";
           novaLinha[STATUS_COL] = novoStatus;
 
-          updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus });
+          const uCf = { linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: novoId };
+          if (resetCicloCf || vencidaCf) _prepararEncerramento_(uCf, dbItem.row, id, resetCicloCf ? { qtd: pedidosQtdCf, base: baselineCicloCf } : null);
+          updates.push(uCf);
           idsAtualizados.push({ de: id, para: novoId, linha: dbItem.linha });
 
           fonteMap.delete(novoId);
@@ -4174,12 +4335,14 @@ function sincronizarDados() {
           && baselineCicloFp !== undefined && pedidosQtdFp !== baselineCicloFp
           && statusAtual !== "Faturado" && statusAtual !== "Finalizado";
         const qtdParaDBFp     = (temBaixasFp && !resetCicloFp) ? dbQtdFp : pedidosQtdFp;
+        const vencidaFp = !resetCicloFp && _marcacaoVencida_(id, dbItem.row, statusAtual);
         if (resetCicloFp) {
-          marcarFaturarAtual = '';
-          _registrarCheckpointFaturamento_(id, pedidosQtdFp);
+          marcarFaturarAtual = '';   // CHECKPOINT só depois da linha gravada (_prepararEncerramento_)
           _removerAlertasDoItem_(id);
-          idsParaLimparUsuario.push({ id: id, linha: dbItem.linha });
           Logger.log(`   🔁 RESET ciclo faturamento (fp): ID="${id}" baseline=${baselineCicloFp} → fonte=${pedidosQtdFp}`);
+        } else if (vencidaFp) {
+          marcarFaturarAtual = '';
+          Logger.log(`   🧹 Marcação vencida (fp): ID="${id}" — encerrada`);
         } else if (!temBaixasFp && pedidosQtdFp !== dbQtdFp) {
           Logger.log(`   🔄 QTD sincronizada com fonte (fingerprint): ${dbQtdFp} → ${pedidosQtdFp} (sem baixas registradas, ID="${id}")`);
         }
@@ -4199,7 +4362,9 @@ function sincronizarDados() {
         const novoStatus = (statusAtual === "Faturado" || statusAtual === "Finalizado") ? statusAtual : "Ativo";
         novaLinha[STATUS_COL] = novoStatus;
 
-        updates.push({ linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: novoId });
+        const uFp = { linha: dbItem.linha, dados: novaLinha, de: statusAtual, para: novoStatus, id: novoId };
+        if (resetCicloFp || vencidaFp) _prepararEncerramento_(uFp, dbItem.row, id, resetCicloFp ? { qtd: pedidosQtdFp, base: baselineCicloFp } : null);
+        updates.push(uFp);
         idsAtualizados.push({ de: id, para: novoId, linha: dbItem.linha });
 
         // Remove do fonteMap para não adicionar como novo depois.
@@ -4549,6 +4714,7 @@ function sincronizarDados() {
       // Relê as linhas que serão regravadas: o sync dura minutos e o usuário pode ter dado baixa,
       // marcado ou excluído nesse meio-tempo — o valor dele não pode ser desfeito pelo snapshot antigo.
       _mesclarAlteracoesConcorrentes_(dbSheet, dbData, updates);
+      const checkpointsDoReset = [];
       updates.forEach(u => {
         if (u.cancelado) return;
         dbSheet.getRange(u.linha, 1, 1, u.dados.length).setValues([u.dados]);
@@ -4558,7 +4724,11 @@ function sincronizarDados() {
           _registrarDecisao_('FATURADO', _usuarioDaMarcacao_(u.dados[MARCAR_FATURAR_USUARIO_COL]),
             'marcado pelo usuário + saiu da origem (sincronização)', u.dados, `status anterior: ${u.de}`);
         }
+        if (u.encerramento) _registrarEncerramento_(u, checkpointsDoReset);
       });
+      // CHECKPOINT do reset de ciclo: só depois da linha gravada já sem a marcação. Se a execução morrer
+      // antes daqui, a rodada seguinte refaz o reset inteiro — nunca "ciclo novo com marcação velha".
+      _registrarCheckpointsEmLote_(checkpointsDoReset);
       _gravarDecisoes_();
     }
 
@@ -4620,16 +4790,6 @@ function sincronizarDados() {
       } catch (eBaixas) {
         Logger.log(`   ⚠️ Erro ao atualizar IDs no Baixas_Historico: ${eBaixas.message}`);
       }
-    }
-
-    // Limpa MARCAR_FATURAR_USUARIO (col V) e LOTE_EMISSAO (col W) para itens com reset de ciclo.
-    // novaLinha cobre só 21 colunas (A–U) e não alcança col V/W — passo separado necessário.
-    if (idsParaLimparUsuario.length > 0) {
-      idsParaLimparUsuario.forEach(({ linha }) => {
-        dbSheet.getRange(linha, MARCAR_FATURAR_USUARIO_COL + 1).setValue('');
-        dbSheet.getRange(linha, LOTE_EMISSAO_COL + 1).setValue('');
-      });
-      Logger.log(`   🧹 MARCAR_FATURAR_USUARIO e LOTE_EMISSAO limpos para ${idsParaLimparUsuario.length} item(ns) com reset de ciclo`);
     }
 
     // Propaga SEQ_ORIGINAL (PEDIDOS col V) para SEQUENCIA (Relatorio_DB col Y).
@@ -6129,13 +6289,11 @@ function finalizarMultiplosItens(items) {
 function marcarParaFaturar(uniqueId, planilhaLinha, marcar, usuario, perfil) {
   try {
     const sheet = getSpreadsheet_().getSheetByName(DB_SHEET_NAME);
-    const linhaNum = Number(planilhaLinha);
     const perfilNorm = String(perfil || 'BAIXA1').trim() || 'BAIXA1';
 
     if (!sheet) throw new Error("Aba DB não encontrada");
-    if (!isFinite(linhaNum) || linhaNum < 2 || linhaNum > sheet.getLastRow()) {
-      throw new Error(`Linha inválida: ${planilhaLinha}`);
-    }
+    // Confere o ID: a limpeza diária apaga linhas e a tela pode estar com o número antigo
+    const linhaNum = _resolverLinhaDoItem_(sheet, uniqueId, planilhaLinha);
 
     // Lê cabeçalhos - força leitura de pelo menos 24 colunas (A-X)
     const numCols = Math.max(sheet.getLastColumn(), 24);
@@ -6165,6 +6323,29 @@ function marcarParaFaturar(uniqueId, planilhaLinha, marcar, usuario, perfil) {
 
     // Lê linha atual uma vez (evita múltiplas chamadas de getRange)
     const rowData = sheet.getRange(linhaNum, 1, 1, numCols).getValues()[0];
+
+    // Marcar exige baixa no ciclo atual (ou QTD zerada). A tela nunca marca sem isso — pede a baixa total
+    // antes —, então só chega aqui página desatualizada: item que o ERP já faturou (último registro do
+    // histórico = CHECKPOINT) iria para o relatório com o saldo inteiro (incidente de 18/11/2026).
+    let baixadoNoCiclo = null;
+    if (marcar) {
+      const qtdCol = colMap['QTD. ABERTA'] !== undefined ? colMap['QTD. ABERTA'] : DB_QTD_COL;
+      const qtdAtual = _toNumber_(rowData[qtdCol]);
+      if (qtdAtual > 0) {
+        const ultimo = _ultimoRegistroBaixa_(uniqueId);
+        if (!ultimo || ultimo.tipo === 'CHECKPOINT') {
+          Logger.log(`🚫 Marcação recusada: ID="${uniqueId}" com QTD ${qtdAtual} e sem baixa no ciclo atual`);
+          return {
+            success: false,
+            semBaixaNoCiclo: true,
+            error: `Este item não tem baixa desde o último faturamento (QTD aberta: ${qtdAtual}). Dê a baixa antes de marcar. Se a tela mostrava outro saldo, recarregue a página (Ctrl+F5).`,
+            id: uniqueId,
+            linha: linhaNum
+          };
+        }
+        baixadoNoCiclo = ultimo.qtdOriginal - qtdAtual;
+      }
+    }
     const perfilAtualNoDb = perfilCol !== undefined ? String(rowData[perfilCol] || '').trim() : '';
 
     // Parse PERFIL_EMISSAO como lista (suporta múltiplos perfis separados por vírgula)
@@ -6229,6 +6410,11 @@ function marcarParaFaturar(uniqueId, planilhaLinha, marcar, usuario, perfil) {
 
     SpreadsheetApp.flush();
     limparCache();
+
+    // Rastro permanente de quem marcou/desmarcou e quando
+    _registrarDecisao_(marcar ? 'MARCOU' : 'DESMARCOU', usuario, 'marcação para faturar (tela)', rowData,
+      `perfil ${perfilNorm}` + (baixadoNoCiclo !== null ? ` — baixado no ciclo: ${baixadoNoCiclo}` : ''));
+    _gravarDecisoes_();
 
     const usuarioValor = marcar ? String(usuario || '').trim() : '';
     Logger.log(`✓ ${uniqueId} → Marcado para faturar: ${marcar} por "${usuarioValor}" perfil "${perfilNorm}" (linha ${linhaNum}). Perfis ativos: ${novoPerfilEmissao}`);
@@ -6332,11 +6518,11 @@ function registrarLoteEmissao(itensData) {
       return { success: false, error: 'Coluna LOTE_EMISSAO ainda não existe; tente novamente após sincronização.' };
     }
 
-    const lastRow = sheet.getLastRow();
     let gravados  = 0;
-    itensData.forEach(({ planilhaLinha, loteId }) => {
-      const linhaNum = Number(planilhaLinha);
-      if (!isFinite(linhaNum) || linhaNum < 2 || linhaNum > lastRow) return;
+    itensData.forEach(({ planilhaLinha, uniqueId, loteId }) => {
+      let linhaNum;
+      try { linhaNum = _resolverLinhaDoItem_(sheet, uniqueId, planilhaLinha); } // confere o ID da linha
+      catch (e) { Logger.log(`⚠️ registrarLoteEmissao: ${e.message}`); return; }
       sheet.getRange(linhaNum, loteEmCol + 1).setValue(loteId || '');
       gravados++;
     });
@@ -6432,6 +6618,7 @@ function obterItensMarcadosParaFaturar(perfil) {
     const displayValues = range.getDisplayValues();
 
     const itensMarcados = [];
+    const semBaixa = []; // marcados com QTD aberta e sem baixa no ciclo: não entram (ver abaixo)
 
     const perfilCol = colMap['PERFIL_EMISSAO'];
 
@@ -6456,9 +6643,18 @@ function obterItensMarcadosParaFaturar(perfil) {
           const qtdAberta        = item['QTD. ABERTA']   || 0;
           const qtdOriginal      = item['QTD. ORIGINAL'] || 0;
           const saldoCalculado   = qtdOriginal - qtdAberta;
-          // Se o saldo calculado é 0 ou negativo (nenhuma baixa registrada ou fallback igualou
-          // qtdOriginal a qtdAberta), usa QTD.ABERTA diretamente para não zerar o relatório.
-          const saldo = saldoCalculado > 0 ? saldoCalculado : qtdAberta;
+          // Sem baixa no ciclo e com QTD aberta NÃO há o que faturar. Antes o relatório usava a QTD aberta
+          // inteira: depois de uma NF parcial, o saldo restante aparecia "a faturar" no nome de quem marcou o
+          // ciclo anterior (incidente de 18/11/2026). O item sai da lista e volta em `semBaixa` (a tela avisa).
+          if (saldoCalculado <= 0 && qtdAberta > 0) {
+            semBaixa.push({
+              uniqueId: item.uniqueId, 'ORD. COMPRA': item['ORD. COMPRA'], CLIENTE: item.CLIENTE,
+              'CÓD. CLIENTE': item['CÓD. CLIENTE'], TAMANHO: item.TAMANHO, 'QTD. ABERTA': qtdAberta,
+              MARCAR_FATURAR_USUARIO: _usuarioDaMarcacao_(item.MARCAR_FATURAR_USUARIO)
+            });
+            return;
+          }
+          const saldo = saldoCalculado > 0 ? saldoCalculado : qtdAberta; // aqui qtdAberta só é usada se for 0
 
           // Serializa o item para JSON (converte Date objects para strings)
           const itemSerializado = {
@@ -6502,7 +6698,8 @@ function obterItensMarcadosParaFaturar(perfil) {
     Logger.log(`📋 Encontrados ${itensMarcados.length} itens marcados para faturar`);
 
     // Retorna com JSON.parse(JSON.stringify()) para garantir tipos JSON puros
-    const result = { success: true, items: itensMarcados };
+    if (semBaixa.length > 0) Logger.log(`⚠️ ${semBaixa.length} item(ns) marcado(s) sem baixa no ciclo ficaram fora do relatório`);
+    const result = { success: true, items: itensMarcados, semBaixa: semBaixa };
     return JSON.parse(JSON.stringify(result));
 
   } catch (e) {
