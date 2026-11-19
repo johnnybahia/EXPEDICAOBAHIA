@@ -91,6 +91,34 @@ const LISTA = [
   await page.evaluate(() => showBaixaConfirmacaoModal('x', () => {}, () => {}));
   r.posBaixaSemCancelar = !(await visivel('#baixa-confirmacao-cancelar-btn'));
   await page.evaluate(() => hideBaixaConfirmacaoModal());
+  // Atualização automática (antes: canAutoRefresh dava erro — $confirmModal não existe — e o refresh morria)
+  r.refresh = await page.evaluate(() => {
+    document.querySelectorAll('.modal-overlay').forEach(m => m.classList.add('hidden'));
+    $loader.classList.add('hidden');
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    const out = { intervalo: AUTO_REFRESH_INTERVAL };
+    try { out.livre = canAutoRefresh(); } catch (e) { out.erro = e.message; }
+    document.getElementById('successModal').classList.remove('hidden');
+    try { out.comJanela = canAutoRefresh(); } catch (e) { out.erro = e.message; }
+    document.getElementById('successModal').classList.add('hidden');
+    const busca = document.createElement('input'); document.body.appendChild(busca); busca.focus();
+    try { out.digitando = canAutoRefresh(); } catch (e) { out.erro = e.message; }
+    busca.remove();
+    // dispara na hora o temporizador do refresh e confere que ele busca os dados no servidor
+    const st = window.setTimeout, capturados = [];
+    window.setTimeout = (fn, ms, ...a) => { if (ms === AUTO_REFRESH_INTERVAL) { capturados.push(fn); return 0; } return st(fn, ms, ...a); };
+    try { scheduleAutoRefresh(); } finally { window.setTimeout = st; }
+    const antes = window.__chamadas.filter(c => c.nome === 'fetchAllDataUnified').length;
+    try { capturados.forEach(fn => fn()); } catch (e) { out.erro = e.message; }
+    out.agendou = capturados.length;
+    out.buscou = window.__chamadas.filter(c => c.nome === 'fetchAllDataUnified').length - antes;
+    return out;
+  });
+  // Teclado: atalhos de linha desligados — nenhuma tecla marca nada nem dá erro
+  const marcacoesAntesTeclas = await page.evaluate(() => window.__chamadas.filter(c => c.nome === 'marcarParaFaturar').length);
+  await page.keyboard.press('ArrowDown'); await page.keyboard.press(' '); await page.keyboard.press('Escape');
+  await page.waitForTimeout(50);
+  r.teclasMarcaram = (await page.evaluate(() => window.__chamadas.filter(c => c.nome === 'marcarParaFaturar').length)) - marcacoesAntesTeclas;
   // Faixa de versão: visível na tela, some na impressão
   r.faixa = await visivel('#faixa-versao');
   await page.emulateMedia({ media: 'print' });
@@ -121,6 +149,14 @@ const LISTA = [
   R.t('CANCELAR não marca e desmarca a caixa', () => assert.deepStrictEqual(r.cancelou, { marcou: false, checkbox: false }));
   R.t('PARCIAL marca só o baixado: marcarParaFaturar(id, linha, true, usuário, perfil)', () => assert.deepStrictEqual(r.parcialChamada, ['ID-P', 77, true, 'ANA', 'BAIXA1']));
   R.t('a janela depois da baixa continua só com TOTAL e PARCIAL', () => assert.strictEqual(r.posBaixaSemCancelar, true));
+  R.t('atualização automática: sem erro; adia com janela aberta ou com alguém digitando', () => {
+    assert.strictEqual(r.refresh.erro, undefined, r.refresh.erro);
+    assert.deepStrictEqual([r.refresh.livre, r.refresh.comJanela, r.refresh.digitando], [true, false, false]);
+  });
+  R.t('atualização automática a cada 2 min dispara e busca os dados no servidor', () => {
+    assert.strictEqual(r.refresh.intervalo, 120000); assert.strictEqual(r.refresh.agendou, 1); assert.strictEqual(r.refresh.buscou, 1);
+  });
+  R.t('teclado: atalhos de linha desligados (nenhuma tecla marca para faturar)', () => assert.strictEqual(r.teclasMarcaram, 0));
   R.t('faixa de versão aparece na tela e some na impressão', () => { assert.strictEqual(r.faixa, true); assert.strictEqual(r.faixaImpressao, false); });
   R.t('a página não gera erro de JavaScript', () => assert.deepStrictEqual(errosDePagina, []));
   R.fim();

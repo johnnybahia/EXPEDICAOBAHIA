@@ -21,7 +21,7 @@ const APP_VERSION = '15.7-SINCRONIZACAO';
 
 // Versão mostrada na faixa acima do programa (INDEX.HTML, repassada por doGet). Toda alteração sobe a
 // versão e ganha uma linha em NOTAS.md — regra do CLAUDE.md.
-const VERSAO = '1.0.0';
+const VERSAO = '1.0.1';
 const VERSAO_DATA = '19/11/2026';
 
 // Utilities.formatDate é uma chamada de serviço do Apps Script (~ms cada). Chamada por linha em
