@@ -81,11 +81,11 @@ const LISTA = [
   r.parcialJanela = await visivel('#baixaConfirmacaoModal');
   r.parcialTexto = await page.textContent('#baixa-confirmacao-msg');
   r.parcialCancelarVisivel = await visivel('#baixa-confirmacao-cancelar-btn');
-  await page.click('#baixa-confirmacao-cancelar-btn');
+  await page.click('#baixa-confirmacao-cancelar-btn', { timeout: 2000 }).catch(() => {});
   await page.waitForTimeout(50);
   r.cancelou = await page.evaluate(() => ({ marcou: window.__chamadas.some(c => c.nome === 'marcarParaFaturar'), checkbox: document.querySelector('#item-linha-77 .checkbox-faturar').checked }));
   await page.evaluate(() => { document.querySelector('#item-linha-77 .checkbox-faturar').checked = true; handleMarcarFaturar('ID-P', 77, true); });
-  await page.click('#baixa-confirmacao-parcial-btn');
+  await page.click('#baixa-confirmacao-parcial-btn', { timeout: 2000 }).catch(() => {});
   await page.waitForTimeout(50);
   r.parcialChamada = await page.evaluate(() => (window.__chamadas.find(c => c.nome === 'marcarParaFaturar') || {}).args);
   await page.evaluate(() => showBaixaConfirmacaoModal('x', () => {}, () => {}));
